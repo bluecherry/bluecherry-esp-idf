@@ -317,7 +317,7 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
  */
 void app_main(void)
 {
-  ESP_LOGI(TAG, "BlueCherry example V1.1.0");
+  ESP_LOGI(TAG, "BlueCherry example V1.2.0");
 
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));

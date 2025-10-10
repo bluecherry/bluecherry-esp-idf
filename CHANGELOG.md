@@ -10,6 +10,8 @@
 
 ## [V1.1.0](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.1.0)
 
+## [V1.2.0](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.2.0)
+
 ### Features
 
 - cpp support ([#1](https://github.com/bluecherry/bluecherry-esp-idf/pull/1))
