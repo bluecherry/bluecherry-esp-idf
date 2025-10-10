@@ -2,10 +2,10 @@
  * @file wifi.h
  * @author Daan Pape (daan@dptechnics.com)
  * @brief This code connects to the BlueCherry platform.
- * @version 1.0.0
+ * @version 1.1.0
  * @date 2025-07-25
  * @copyright Copyright (c) 2025 DPTechnics BV
- * 
+ *
  * This example is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
