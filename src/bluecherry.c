@@ -313,6 +313,7 @@ static bool _blueCherryProcessEvent(uint8_t* data, uint8_t len)
 }
 
 #pragma endregion
+#pragma region MBEDTLS
 
 /**
  * @brief Read up to len bytes from the DTLS socket.
@@ -383,6 +384,9 @@ static int _bluecherry_mbed_dtls_write(const unsigned char* buf, size_t len)
   } while(true);
 }
 
+#pragma endregion
+#pragma region CoAP
+
 /**
  * @brief Perform CoAP transmit and receive operations with the BlueCherry cloud.
  *
@@ -452,6 +456,8 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
   _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
   return ESP_ERR_TIMEOUT;
 }
+
+#pragma endregion
 
 /**
  * @brief The entrypoint of the automatic BlueCherry synchronisation task.
@@ -534,6 +540,8 @@ static int _bluecherry_dtls_recv(void* ctx, unsigned char* buf, size_t len)
 
   return ret;
 }
+
+#pragma region PUBLIC
 
 static esp_err_t bluecherry_connect(void)
 {
@@ -901,3 +909,5 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
 
   return ESP_OK;
 }
+
+#pragma endregion

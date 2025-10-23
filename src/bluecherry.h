@@ -87,6 +87,9 @@ extern "C" {
  */
 static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
 
+typedef void (*bluecherry_ztp_bio_handler_t)(const char* key, const char* value, bool read,
+                                             bool secure);
+
 /**
  * @brief Header of the function that handles incoming MQTT messages.
  *
