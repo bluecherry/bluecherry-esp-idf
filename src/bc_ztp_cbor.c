@@ -53,7 +53,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "BlueCherryZTP_CBOR.h"
+#include "bc_ztp_cbor.h"
 
 int ztp_cbor_init(ZTP_CBOR* cbor, uint8_t* buffer, size_t capacity)
 {

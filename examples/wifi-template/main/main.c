@@ -312,6 +312,11 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
   ESP_LOGI(TAG, "Received MQTT message of length %d on topic %02X: %.*s", len, topic, len, data);
 }
 
+static const char* bluecherry_ztp_bio_handler(bool read, bool secure, void* args) {
+    if (!read) return NULL;
+    return secure ? devkey : devcert;
+}
+
 /**
  * @brief The main application entrypoint.
  */
@@ -321,7 +326,7 @@ void app_main(void)
 
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));
-  ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
+  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, "walter01", bluecherry_msg_handler, NULL, true, 30));
 
   while(true) {
     ESP_LOGI(TAG, "Publishing message");

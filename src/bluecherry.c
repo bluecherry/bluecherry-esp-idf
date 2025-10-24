@@ -613,10 +613,17 @@ static esp_err_t bluecherry_connect(void)
   return ESP_OK;
 }
 
+/**
+ * STATIC PROVISIONING (NO ZTP)
+ */
 esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
                           bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
                           bool auto_sync, uint16_t watchdog_timeout_seconds)
 {
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
+    goto error;
+  }
+
   if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED) {
     return ESP_OK;
   }
@@ -760,6 +767,73 @@ error:
   mbedtls_pk_free(&_bluecherry_opdata.devkey);
   _bluecherry_opdata.state = BLUECHERRY_STATE_UNINITIALIZED;
   return ESP_FAIL;
+}
+
+/**
+ * ZERO TOUCH PROVISIONING
+ */
+esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
+                              void* ztp_bio_handler_args, const char* bc_device_type,
+                              bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
+                              bool auto_sync, uint16_t watchdog_timeout_seconds)
+{
+  if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED &&
+     _bluecherry_opdata.state != BLUECHERRY_STATE_NOT_PROVISIONED) {
+    return ESP_OK;
+  }
+
+  // ZTP STEP 1: Attempt to read certifications
+  const char* device_cert = ztp_bio_handler(true, false, NULL);
+  const char* device_key = ztp_bio_handler(true, true, NULL);
+
+  if(device_cert == NULL || device_key == NULL) {
+    _bluecherry_opdata.state = BLUECHERRY_STATE_NOT_PROVISIONED;
+  }
+
+  // Fetch MAC address
+  uint8_t mac[8] = { 0 };
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
+  // ZTP STEP 2: Provision ZTP
+
+  ESP_LOGW(TAG, "Device is not provisioned for BlueCherry communication, starting ZTP...");
+
+  if(!ztp_begin(bc_device_type, BLUECHERRY_CA, mac)) {
+    ESP_LOGE(TAG, "Failed to initialize ZTP");
+    return -1;
+  }
+
+  if(!ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
+    ESP_LOGE(TAG, "Could not add MAC address as ZTP device ID parameter");
+  }
+
+  // Request the BlueCherry device ID
+  if(!ztp_request_device_id()) {
+    ESP_LOGE(TAG, "Could not request device ID");
+    return -1;
+  }
+
+  // // Generate the private key and CSR
+  // if(!BlueCherryZTP::generateKeyAndCsr()) {
+  //   Serial.println("Error: Could not generate private key");
+  // }
+  // delay(1000);
+
+  // // Request the signed certificate
+  // if(!BlueCherryZTP::requestSignedCertificate()) {
+  //   Serial.println("Error: Could not request signed certificate");
+  //   continue;
+  // }
+
+  // // Store BlueCherry TLS certificates + private key in the modem
+  // if(!modem.blueCherryProvision(BlueCherryZTP::getCert(), BlueCherryZTP::getPrivKey(),
+  //                               bc_ca_cert)) {
+  //   Serial.println("Error: Failed to upload the DTLS certificates");
+  //   continue;
+  // }
+
+  return bluecherry_init(device_cert, device_key, msg_handler, msg_handler_args, auto_sync,
+                         watchdog_timeout_seconds);
 }
 
 esp_err_t bluecherry_sync(bool blocking)

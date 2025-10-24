@@ -41,6 +41,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <bc_ztp.h>
 #include <netdb.h>
 #include <errno.h>
 #include <time.h>
@@ -87,8 +88,7 @@ extern "C" {
  */
 static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
 
-typedef void (*bluecherry_ztp_bio_handler_t)(const char* key, const char* value, bool read,
-                                             bool secure);
+typedef const char* (*bluecherry_ztp_bio_handler_t)(bool read, bool secure, void* args);
 
 /**
  * @brief Header of the function that handles incoming MQTT messages.
@@ -117,6 +117,7 @@ typedef enum {
   BLUECHERRY_STATE_CONNECTED_TIMED_OUT,
   BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK,
   BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES,
+  BLUECHERRY_STATE_NOT_PROVISIONED
 } bluecherry_state;
 
 /**
@@ -389,6 +390,28 @@ typedef struct {
 esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
                           bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
                           bool auto_sync, uint16_t watchdog_timeout_seconds);
+
+/**
+ * @brief Initialize the BlueCherry subsystem with ZTP.
+ *
+ * This function will initialize the BlueCherry IoT module without zero-touch provisioning enabled.
+ *
+ * @param ztp_bio_handler
+ * @param ztp_bio_handler_args Optional user pointer which is passed to the ZTP bio handler.
+ * @param bc_device_type
+ * @param msg_handler The handler used for incoming messages or NULL to ignore them.
+ * @param msg_handler_args Optional user pointer which is passed to the message handler.
+ * @param auto_sync When set to true, the library will atomatically perform syncs in the background.
+ * @param watchdog_timeout_seconds The timeout in seconds for the task watchdog. If not 0, your
+ * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
+ * Should be more than 30 seconds
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
+                              void* ztp_bio_handler_args, const char* bc_device_type,
+                              bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
+                              bool auto_sync, uint16_t watchdog_timeout_seconds);
 
 /**
  * @brief Synchronize incoming and outgoing BlueCherry messages and perform OTA.
