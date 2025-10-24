@@ -41,7 +41,6 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <bc_ztp.h>
 #include <netdb.h>
 #include <errno.h>
 #include <time.h>

@@ -243,7 +243,11 @@ static mbedtls_timing_delay_context ztp_timing_ctx;
 /**
  * @brief Mbed TLS certificate creation object.
  */
+static mbedtls_x509_crt ztp_mbCrt;
+
 static mbedtls_x509_crt ztp_cacert;
+
+static int ztp_socket_num;
 
 /**
  * @brief The device ZTP identification data.
@@ -398,7 +402,7 @@ int bluecherry_ztp_dtls_send(void* ctx, const unsigned char* buf, size_t len);
 
 int bluecherry_ztp_dtls_recv(void* ctx, unsigned char* buf, size_t len);
 
-bool bluecherry_ztp_rxtx(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint16_t* rx_len);
+bool bluecherry_ztp_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint16_t* rx_len);
 
 /**
  * @brief Request a provisional BlueCherry Device ID from the ZTP server.

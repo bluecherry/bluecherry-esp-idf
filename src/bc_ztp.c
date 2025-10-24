@@ -160,6 +160,60 @@ bool ztp_begin(const char* typeId, const char* caCert, uint8_t* mac)
     return false;
   }
 
+  struct addrinfo hints = { 0 };
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  struct addrinfo* res = NULL;
+  ret = getaddrinfo(ZTP_SERV_ADDR, ZTP_SERV_PORT, &hints, &res);
+  if(ret != 0 || res == NULL) {
+    ESP_LOGE("ZTP", "DNS lookup failed: %d", ret);
+    if(res)
+      freeaddrinfo(res);
+    return false;
+  }
+
+  ztp_socket_num = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if(ztp_socket_num < 0) {
+    ESP_LOGE("ZTP", "socket() failed: %s", strerror(errno));
+    freeaddrinfo(res);
+    return false;
+  }
+
+  struct timeval timeout;
+  timeout.tv_sec = 3;
+  timeout.tv_usec = 0;
+  setsockopt(ztp_socket_num, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  ret = connect(ztp_socket_num, res->ai_addr, res->ai_addrlen);
+  if(ret != 0) {
+    ESP_LOGE("ZTP", "connect() failed: %s", strerror(errno));
+    close(ztp_socket_num);
+    freeaddrinfo(res);
+    return false;
+  }
+  freeaddrinfo(res);
+
+  mbedtls_ssl_session_reset(&ztp_ssl_ctx);
+  mbedtls_ssl_set_bio(&ztp_ssl_ctx, &ztp_socket_num, bluecherry_ztp_dtls_send,
+                      bluecherry_ztp_dtls_recv, NULL);
+
+  time_t t_start = time(NULL);
+  while((ret = mbedtls_ssl_handshake(&ztp_ssl_ctx)) != 0) {
+    if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+       ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+      if(difftime(time(NULL), t_start) >= 30) {
+        ESP_LOGE("ZTP", "DTLS handshake timed out");
+        return false;
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    ESP_LOGE("ZTP", "DTLS handshake failed: -0x%04X", -ret);
+    return false;
+  }
+
   return true;
 }
 
@@ -326,39 +380,41 @@ int bluecherry_ztp_dtls_recv(void* ctx, unsigned char* buf, size_t len)
   return ret;
 }
 
-bool bluecherry_ztp_rxtx(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint16_t* rx_len)
+bool bluecherry_ztp_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint16_t* rx_len)
 {
-  uint8_t no_payload_hdr[14];
-  uint8_t* data = tx_len == 0 ? no_payload_hdr : tx_buf;
-  size_t data_len = tx_len == 0 ? 14 : tx_len;
-
-  static uint32_t cur_message_id = 0;
+  uint8_t header[14] = { 0 };
+  static uint32_t cur_message_id = 1;
   static uint32_t last_acked_message_id = 0;
   static time_t last_tx_time = 0;
-
-  if(data_len < 14) {
-    ESP_LOGE("ZTP", "Cannot send CoAP message smaller than %dB", 14);
-    return false;
-  }
 
   if(last_acked_message_id > cur_message_id) {
     last_acked_message_id -= 0xffff;
   }
 
-  data[0] = 0x40;
-  data[1] = 0x01;
-  data[2] = cur_message_id >> 8;
-  data[3] = cur_message_id & 0xFF;
-  data[4] = 0xB2;
-  data[5] = 0x76;
-  data[6] = 0x31;
-  data[7] = 0x05;
-  data[8] = 0x64;
-  data[9] = 0x65;
-  data[10] = 0x76;
-  data[11] = 0x69;
-  data[12] = 0x64;
-  data[13] = 0xFF;
+  header[0] = 0x40;
+  header[1] = 0x01;
+  header[2] = cur_message_id >> 8;
+  header[3] = cur_message_id & 0xFF;
+  header[4] = 0xB2;
+  header[5] = 0x76;
+  header[6] = 0x31;
+  header[7] = 0x05;
+  header[8] = 0x64;
+  header[9] = 0x65;
+  header[10] = 0x76;
+  header[11] = 0x69;
+  header[12] = 0x64;
+
+  size_t data_len = 13;      // default header length without 0xFF
+  uint8_t data[14 + tx_len]; // max possible size
+
+  memcpy(data, header, 13);
+
+  if(tx_len > 0) {
+    data[13] = 0xFF;                   // only append 0xFF if there is a payload
+    memcpy(data + 14, tx_buf, tx_len); // payload after header+0xFF
+    data_len = 14 + tx_len;            // total length
+  }
 
   double timeout = 2.0 * (1 + (rand() / (RAND_MAX + 1.0)) * (1.5 - 1));
 
@@ -370,9 +426,87 @@ bool bluecherry_ztp_rxtx(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint
     }
 
     while(true) {
-      int ret = bluecherry_ztp_mbed_dtls_read(rx_buf, 1024);
+      uint8_t temp_buf[1024];
+      int ret = bluecherry_ztp_mbed_dtls_read(temp_buf, sizeof(temp_buf));
+
       if(ret > 0) {
-        *rx_len = (uint16_t) ret;
+        if(ret > 7) {
+          memcpy(rx_buf, temp_buf + 7, ret - 7);
+          *rx_len = (uint16_t) (ret - 7);
+        } else {
+          *rx_len = 0; // nothing meaningful received
+        }
+        return true;
+      } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
+        return false;
+      }
+
+      if(difftime(time(NULL), last_tx_time) >= timeout) {
+        break;
+      }
+    }
+
+    timeout *= 2;
+  }
+
+  return false;
+}
+
+bool bluecherry_ztp_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf, uint16_t* rx_len)
+{
+  uint8_t header[13] = { 0 };
+  static uint32_t cur_message_id = 2;
+  static uint32_t last_acked_message_id = 1;
+  static time_t last_tx_time = 0;
+
+  if(last_acked_message_id > cur_message_id) {
+    last_acked_message_id -= 0xffff;
+  }
+
+  header[0] = 0x40;
+  header[1] = 0x01;
+  header[2] = cur_message_id >> 8;
+  header[3] = cur_message_id & 0xFF;
+  header[4] = 0xB2;
+  header[5] = 0x76;
+  header[6] = 0x31;
+  header[7] = 0x04;
+  header[8] = 0x73;
+  header[9] = 0x69;
+  header[10] = 0x67;
+  header[11] = 0x6E;
+
+  size_t data_len = 12;      // default header length without 0xFF
+  uint8_t data[13 + tx_len]; // max possible size
+
+  memcpy(data, header, 12);
+
+  if(tx_len > 0) {
+    data[12] = 0xFF;                   // only append 0xFF if there is a payload
+    memcpy(data + 13, tx_buf, tx_len); // payload after header+0xFF
+    data_len = 13 + tx_len;            // total length
+  }
+
+  double timeout = 2.0 * (1 + (rand() / (RAND_MAX + 1.0)) * (1.5 - 1));
+
+  for(uint8_t attempt = 1; attempt <= 4; ++attempt) {
+    last_tx_time = time(NULL);
+
+    if(bluecherry_ztp_mbed_dtls_write(data, data_len) < 0) {
+      return false;
+    }
+
+    while(true) {
+      uint8_t temp_buf[1024];
+      int ret = bluecherry_ztp_mbed_dtls_read(temp_buf, sizeof(temp_buf));
+
+      if(ret > 0) {
+        if(ret > 7) {
+          memcpy(rx_buf, temp_buf + 7, ret - 7);
+          *rx_len = (uint16_t) (ret - 7);
+        } else {
+          *rx_len = 0;
+        }
         return true;
       } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
         return false;
@@ -459,224 +593,127 @@ bool ztp_request_device_id()
     }
   }
 
-  struct addrinfo hints = { 0 };
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_DGRAM;
-  struct addrinfo* res = NULL;
-  ret = getaddrinfo(ZTP_SERV_ADDR, ZTP_SERV_PORT, &hints, &res);
-  if(ret != 0 || res == NULL) {
-    ESP_LOGE("ZTP", "DNS lookup failed: %d", ret);
-    if(res)
-      freeaddrinfo(res);
-    return false;
-  }
-
-  int socket_num = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if(socket_num < 0) {
-    ESP_LOGE("ZTP", "socket() failed: %s", strerror(errno));
-    freeaddrinfo(res);
-    return false;
-  }
-
-  struct timeval timeout;
-  timeout.tv_sec = 3;
-  timeout.tv_usec = 0;
-  setsockopt(socket_num, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-  ret = connect(socket_num, res->ai_addr, res->ai_addrlen);
-  if(ret != 0) {
-    ESP_LOGE("ZTP", "connect() failed: %s", strerror(errno));
-    close(socket_num);
-    freeaddrinfo(res);
-    return false;
-  }
-  freeaddrinfo(res);
-
-  mbedtls_ssl_session_reset(&ztp_ssl_ctx);
-  mbedtls_ssl_set_bio(&ztp_ssl_ctx, &socket_num, bluecherry_ztp_dtls_send, bluecherry_ztp_dtls_recv,
-                      NULL);
-
-  time_t t_start = time(NULL);
-  while((ret = mbedtls_ssl_handshake(&ztp_ssl_ctx)) != 0) {
-    if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-       ret == MBEDTLS_ERR_SSL_TIMEOUT) {
-      if(difftime(time(NULL), t_start) >= 30) {
-        ESP_LOGE("ZTP", "DTLS handshake timed out");
-        return false;
-      }
-
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-
-    ESP_LOGE("ZTP", "DTLS handshake failed: -0x%04X", -ret);
-    return false;
-  }
-
   uint8_t in_buf[1024];
   uint16_t in_len = 0;
-  ret = bluecherry_ztp_rxtx(cborBuf, ztp_cbor_size(&cbor), in_buf, &in_len);
-  if(ret < 1) {
-    ESP_LOGE("ZTP", "Failed to receive response from ZTP COAP server");
+  if(!bluecherry_ztp_rxtx_devid(cborBuf, ztp_cbor_size(&cbor), in_buf, &in_len)) {
+    ESP_LOGE("ZTP", "Failed to sync with ZTP COAP server");
     return false;
   }
 
-  // Print received CoAP data in hex and halt
-  printf("Received CoAP response (%d bytes):\n", ret);
-  for(int i = 0; i < ret; i++) {
-    printf("%02X ", in_buf[i]);
-    if((i + 1) % 16 == 0)
-      printf("\n"); // nice 16-byte formatting
+  ret = ztp_cbor_decode_device_id(in_buf, in_len, ztp_bcDevId, sizeof(ztp_bcDevId));
+  if(ret < 0) {
+    printf("Failed to decode device id: %d\n", ret);
+    return false;
   }
-  printf("\n");
-  fflush(stdout);
-
-  ESP_LOGI("ZTP", "Halting before device ID decode.");
-  while(1) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  } // infinite loop to halt
-
-  // ret =
-  //     ztp_cbor_decode_device_id(coapData, rsp.data.coapResponse.length, _bcDevId,
-  //     sizeof(_bcDevId));
-  // if(ret < 0) {
-  //   printf("Failed to decode device id: %d\n", ret);
-  //   return false;
-  // }
 
   return true;
 }
 
-// bool ztp_generate_key_and_csr(bool rfEnabled)
-// {
-//   int ret;
-//   uint8_t csrBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+bool ztp_generate_key_and_csr(bool rfEnabled)
+{
+  int ret;
+  uint8_t csrBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
 
-//   if(ztp_bcTypeId == NULL || strlen(ztp_bcTypeId) != BLUECHERRY_ZTP_ID_LEN ||
-//      strlen(ztp_bcDevId) != BLUECHERRY_ZTP_ID_LEN) {
-//     return false;
-//   }
+  if(ztp_bcTypeId == NULL || strlen(ztp_bcTypeId) != BLUECHERRY_ZTP_ID_LEN ||
+     strlen(ztp_bcDevId) != BLUECHERRY_ZTP_ID_LEN) {
+    return false;
+  }
 
-//   mbedtls_pk_init(&ztp_mbKey);
-//   mbedtls_entropy_init(&ztp_mbEntropy);
-//   mbedtls_ctr_drbg_init(&ztp_mbCtrDrbg);
-//   mbedtls_x509write_csr_init(&ztp_mbCsr);
+  mbedtls_pk_init(&ztp_mbKey);
+  // mbedtls_entropy_init(&ztp_mbEntropy);
+  // mbedtls_ctr_drbg_init(&ztp_mbCtrDrbg);
+  mbedtls_x509write_csr_init(&ztp_mbCsr);
 
-//   if(!_seedRandom(rfEnabled)) {
-//     return _finishCsrGen(false);
-//   }
+  // if(!_seedRandom(rfEnabled)) {
+  //   return ztp_finish_csr_gen(false);
+  // }
 
-//   if(mbedtls_pk_setup(&ztp_mbKey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0) {
-//     return _finishCsrGen(false);
-//   }
+  if(mbedtls_pk_setup(&ztp_mbKey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0) {
+    return ztp_finish_csr_gen(false);
+  }
 
-//   if(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(ztp_mbKey),
-//                          mbedtls_ctr_drbg_random, &ztp_mbCtrDrbg) != 0) {
-//     return _finishCsrGen(false);
-//   }
+  if(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(ztp_mbKey),
+                         mbedtls_ctr_drbg_random, &ztp_mbCtrDrbg) != 0) {
+    return ztp_finish_csr_gen(false);
+  }
 
-//   if(mbedtls_pk_write_key_pem(&ztp_mbKey, (unsigned char*) ztp_pkeyBuf,
-//                               BLUECHERRY_ZTP_PKEY_BUF_SIZE) != 0) {
-//     return _finishCsrGen(false);
-//   }
+  if(mbedtls_pk_write_key_pem(&ztp_mbKey, (unsigned char*) ztp_pkeyBuf,
+                              BLUECHERRY_ZTP_PKEY_BUF_SIZE) != 0) {
+    return ztp_finish_csr_gen(false);
+  }
 
-//   mbedtls_x509write_csr_set_md_alg(&ztp_mbCsr, MBEDTLS_MD_SHA256);
-//   mbedtls_x509write_csr_set_key(&ztp_mbCsr, &ztp_mbKey);
+  mbedtls_x509write_csr_set_md_alg(&ztp_mbCsr, MBEDTLS_MD_SHA256);
+  mbedtls_x509write_csr_set_key(&ztp_mbCsr, &ztp_mbKey);
 
-//   snprintf(ztp_subjBuf, BLUECHERRY_ZTP_SUBJ_BUF_SIZE, "C=BE,CN=%s.%s", ztp_bcTypeId,
-//   ztp_bcDevId); if(mbedtls_x509write_csr_set_subject_name(&ztp_mbCsr, ztp_subjBuf) != 0) {
-//     return _finishCsrGen(false);
-//   }
+  snprintf(ztp_subjBuf, BLUECHERRY_ZTP_SUBJ_BUF_SIZE, "C=BE,CN=%s.%s", ztp_bcTypeId, ztp_bcDevId);
+  if(mbedtls_x509write_csr_set_subject_name(&ztp_mbCsr, ztp_subjBuf) != 0) {
+    return ztp_finish_csr_gen(false);
+  }
 
-//   ret = mbedtls_x509write_csr_der(&ztp_mbCsr, csrBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE,
-//                                   mbedtls_ctr_drbg_random, &ztp_mbCtrDrbg);
-//   if(ret < 0) {
-//     printf("Failed to write CSR: -0x%04X\n", -ret);
-//     return _finishCsrGen(false);
-//   }
+  ret = mbedtls_x509write_csr_der(&ztp_mbCsr, csrBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE,
+                                  mbedtls_ctr_drbg_random, &ztp_mbCtrDrbg);
+  if(ret < 0) {
+    printf("Failed to write CSR: -0x%04X\n", -ret);
+    return ztp_finish_csr_gen(false);
+  }
 
-//   size_t offset = BLUECHERRY_ZTP_CERT_BUF_SIZE - ret;
-//   _csr.length = ret;
-//   memcpy(_csr.buffer, csrBuf + offset, _csr.length);
+  size_t offset = BLUECHERRY_ZTP_CERT_BUF_SIZE - ret;
+  ztp_csr.length = ret;
+  memcpy(ztp_csr.buffer, csrBuf + offset, ztp_csr.length);
 
-//   return _finishCsrGen(true);
-// }
+  return ztp_finish_csr_gen(true);
+}
 
-// bool ztp_request_signed_certificate()
-// {
-//   int ret;
-//   uint8_t buf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
-//   uint8_t coapData[BLUECHERRY_ZTP_CERT_BUF_SIZE];
-//   ZTP_CBOR cbor;
+bool ztp_request_signed_certificate()
+{
+  int ret;
+  uint8_t cborBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+  uint8_t coapData[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+  ZTP_CBOR cbor;
 
-//   ztp_cbor_init(&cbor, buf, BLUECHERRY_ZTP_CERT_BUF_SIZE);
-//   mbedtls_x509_crt_init(&ztp_mbCrt);
+  ztp_cbor_init(&cbor, cborBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE);
+  mbedtls_x509_crt_init(&ztp_mbCrt);
 
-//   if(ztp_cbor_encode_bytes(&cbor, _csr.buffer, _csr.length) < 0) {
-//     printf("Failed to encode CSR\n");
-//     return false;
-//   }
+  if(ztp_cbor_encode_bytes(&cbor, ztp_csr.buffer, ztp_csr.length) < 0) {
+    printf("Failed to encode CSR\n");
+    return false;
+  }
 
-//   // Send second CoAP
-//   if(!_modem->coapSetOptions(COAP_PROFILE, WALTER_MODEM_COAP_OPT_SET,
-//                              WALTER_MODEM_COAP_OPT_CODE_URI_PATH, ZTP_SERV_API_VERSION)) {
-//     printf("Failed to configure ZTP CoAP URI path for API version\n");
-//   }
+  uint16_t in_len = 0;
+  if(!bluecherry_ztp_rxtx_sign(cborBuf, ztp_cbor_size(&cbor), coapData, &in_len)) {
+    ESP_LOGE("ZTP", "Failed to receive response from ZTP COAP server");
+    return false;
+  }
 
-//   if(!_modem->coapSetOptions(COAP_PROFILE, WALTER_MODEM_COAP_OPT_EXTEND,
-//                              WALTER_MODEM_COAP_OPT_CODE_URI_PATH, ZTP_SERV_CSR_PATH)) {
-//     printf("Failed to configure ZTP CoAP URI path for CSR signing\n");
-//   }
+  size_t decodedSize;
+  ret = ztp_cbor_decode_certificate(coapData, in_len, cborBuf, &decodedSize);
+  if(ret < 0) {
+    printf("Failed to decode certificate: %d\n", ret);
+    return false;
+  }
 
-//   if(!_modem->coapSendData(COAP_PROFILE, WALTER_MODEM_COAP_SEND_TYPE_CON,
-//                            WALTER_MODEM_COAP_SEND_METHOD_GET, ztp_cbor_size(&cbor), buf)) {
-//     printf("Failed to send ZTP CoAP datagram\n");
-//     return false;
-//   }
+  // Parse the DER-encoded certificate
+  ret = mbedtls_x509_crt_parse_der(&ztp_mbCrt, cborBuf, decodedSize);
+  if(ret < 0) {
+    printf("Failed to parse DER certificate, error code: -0x%x\n", -ret);
+    mbedtls_x509_crt_free(&ztp_mbCrt);
+    return false;
+  }
 
-//   int i = BLUECHERRY_ZTP_COAP_TIMEOUT;
-//   printf("Awaiting ZTP CoAP ring.");
-//   while(i && !_modem->coapDidRing(COAP_PROFILE, coapData, sizeof(coapData), &rsp)) {
-//     printf(".");
-//     DELAY(1000);
-//     i--;
-//   }
-//   printf("\n");
+  // Convert the certificate to PEM format
+  size_t pemLen;
+  ret = mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                                 ztp_mbCrt.raw.p, ztp_mbCrt.raw.len, cborBuf,
+                                 BLUECHERRY_ZTP_CERT_BUF_SIZE, &pemLen);
+  if(ret < 0) {
+    printf("Failed to write PEM: -0x%04X\n", -ret);
+    mbedtls_x509_crt_free(&ztp_mbCrt);
+    return false;
+  }
 
-//   if(i < 1) {
-//     printf("Failed to receive response from ZTP COAP server\n");
-//     return false;
-//   }
+  memcpy(ztp_certBuf, cborBuf, pemLen);
+  ztp_certBuf[pemLen] = '\0';
 
-//   size_t decodedSize;
-//   ret = ztp_cbor_decode_certificate(coapData, rsp.data.coapResponse.length, buf, &decodedSize);
-//   if(ret < 0) {
-//     printf("Failed to decode certificate: %d\n", ret);
-//     return false;
-//   }
-
-//   // Parse the DER-encoded certificate
-//   ret = mbedtls_x509_crt_parse_der(&ztp_mbCrt, buf, decodedSize);
-//   if(ret < 0) {
-//     printf("Failed to parse DER certificate, error code: -0x%x\n", -ret);
-//     mbedtls_x509_crt_free(&ztp_mbCrt);
-//     return false;
-//   }
-
-//   // Convert the certificate to PEM format
-//   size_t pemLen;
-//   ret = mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
-//                                  ztp_mbCrt.raw.p, ztp_mbCrt.raw.len, buf,
-//                                  BLUECHERRY_ZTP_CERT_BUF_SIZE, &pemLen);
-//   if(ret < 0) {
-//     printf("Failed to write PEM: -0x%04X\n", -ret);
-//     mbedtls_x509_crt_free(&ztp_mbCrt);
-//     return false;
-//   }
-
-//   memcpy(ztp_certBuf, buf, pemLen);
-//   ztp_certBuf[pemLen] = '\0';
-
-//   mbedtls_x509_crt_free(&ztp_mbCrt);
-//   return true;
-// }
+  mbedtls_x509_crt_free(&ztp_mbCrt);
+  return true;
+}
