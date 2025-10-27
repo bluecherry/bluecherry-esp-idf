@@ -1,9 +1,10 @@
 /**
  * @file main.c
- * @author Daan Pape (daan@dptechnics.com)
+ * @author Daan Pape <daan@dptechnics.com>
+ * @author Arnoud Devoogdt <arnoud@dptechnics.com>
  * @brief This code connects to the BlueCherry platform.
- * @version 0.1
- * @date 2025-07-14
+ * @version 1.3.0
+ * @date 2025-10-27
  * @copyright Copyright (c) 2025 DPTechnics BV
  *
  * This program is free software: you can redistribute it and/or modify
@@ -412,7 +413,7 @@ static const char* bluecherry_ztp_bio_handler(bool read, bool secure, void* args
  */
 void app_main(void)
 {
-  ESP_LOGI(TAG, "BlueCherry example V1.2.0");
+  ESP_LOGI(TAG, "BlueCherry example V1.3.0");
 
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));

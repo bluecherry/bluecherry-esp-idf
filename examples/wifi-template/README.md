@@ -8,10 +8,8 @@ applying for your own device-type you can create your device credentials and con
 example allows for:
  - MQTT publish
  - MQTT subscribe
- - *OTA updates
- - *Zero-Touch provisioning
-
-The features marked with a '*' are not yet implemented.
+ - OTA updates
+ - Zero-Touch provisioning
 
 ## Licence 
 

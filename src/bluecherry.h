@@ -4,7 +4,7 @@
  * @author Thibo Verheyde <thibo@dptechnics.com>
  * @author Arnoud Devoogdt <arnoud@dptechnics.com>
  * @brief This code connects to the BlueCherry platform.
- * @version 1.2.0
+ * @version 1.3.0
  * @date 2025-10-27
  * @copyright Copyright (c) 2025 DPTechnics BV
  *

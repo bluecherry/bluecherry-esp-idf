@@ -18,3 +18,10 @@
 - socket and ssl reconnection upon failure (uc) ([#2](https://github.com/bluecherry/bluecherry-esp-idf/pull/2))
 - feat(OTA): added OTA support and improved socket error handling ([#3](https://github.com/bluecherry/bluecherry-esp-idf/pull/3))
 - feat(auto-sync): blocks until queue is ready or timeout ([#4](https://github.com/bluecherry/bluecherry-esp-idf/pull/4))
+
+## [V1.3.0](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.3.0)
+
+### Features
+
+- feat(ZTP): Zero Touch Provisioning integration ([#7](https://github.com/bluecherry/bluecherry-esp-idf/pull/7))
+
