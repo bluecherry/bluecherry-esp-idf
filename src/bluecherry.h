@@ -19,10 +19,13 @@
  */
 
 #include <mbedtls/net_sockets.h>
+#include <bootloader_random.h>
 #include <freertos/FreeRTOS.h>
 #include <mbedtls/platform.h>
 #include <mbedtls/ctr_drbg.h>
 #include <esp_image_format.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/x509_csr.h>
 #include <mbedtls/entropy.h>
 #include <spi_flash_mmap.h>
 #include <mbedtls/timing.h>
@@ -34,6 +37,9 @@
 #include <lwip/sockets.h>
 #include <esp_ota_ops.h>
 #include <esp_vfs_fat.h>
+#include <mbedtls/pem.h>
+#include <mbedtls/pk.h>
+#include <esp_random.h>
 #include <esp_vfs.h>
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -83,6 +89,131 @@ extern "C" {
 #define SPI_FLASH_BLOCK_SIZE (SPI_SECTORS_PER_BLOCK * SPI_FLASH_SEC_SIZE)
 
 /**
+ * @brief The size of the private key buffer.
+ */
+#define BLUECHERRY_ZTP_PKEY_BUF_SIZE 256
+
+/**
+ * @brief The size of the CSR/certificate buffer.
+ */
+#define BLUECHERRY_ZTP_CERT_BUF_SIZE 576
+
+/**
+ * @brief The number of characters in a BlueCherry Type ID or Device ID.
+ */
+#define BLUECHERRY_ZTP_ID_LEN 8
+
+#define ZTP_SERV_ADDR "coap.bluecherry.io"
+#define ZTP_SERV_PORT "5688"
+#define ZTP_SERV_API_VERSION "v1"
+#define ZTP_SERV_DEVID_PATH "devid"
+#define ZTP_SERV_CSR_PATH "sign"
+
+/**
+ * @brief The size of the CSR subject buffer.
+ */
+#define BLUECHERRY_ZTP_SUBJ_BUF_SIZE 32
+
+/**
+ * @brief The length of a MAC address in bytes.
+ */
+#define BLUECHERRY_ZTP_MAC_LEN 6
+
+/**
+ * @brief The length of an IMEI number.
+ */
+#define BLUECHERRY_ZTP_IMEI_LEN 15
+
+/**
+ * @brief The maximum number of device identification parameters.
+ */
+#define BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS 3
+
+/**
+ * @brief The maximum time in seconds to wait for a CoAP ring.
+ */
+#define BLUECHERRY_ZTP_COAP_TIMEOUT 30
+
+/**
+ * @brief This enumeration list all different types of device identification
+ * parameters.
+ */
+typedef enum {
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC = 0,
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI,
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE
+} BlueCherryZtpDeviceIdType;
+
+typedef union {
+  /**
+   * @brief Pointer to the BlueCherry Type ID, as this is always programmed in
+   * the application, no extra memory is required.
+   */
+  const char* bcTypeId;
+
+  /**
+   * @brief A MAC address used for authentication.
+   */
+  unsigned char mac[BLUECHERRY_ZTP_MAC_LEN];
+
+  /**
+   * @brief An IMEI number in ASCII format + 0-terminator.
+   */
+  char imei[BLUECHERRY_ZTP_IMEI_LEN + 1];
+
+  /**
+   * @brief A 64-bit OOB challenge.
+   */
+  unsigned long long oobChallenge;
+} BlueCherryZtpDeviceIdValue;
+
+/**
+ * @brief This structure represents a device identifier.
+ */
+typedef struct {
+  /**
+   * @brief The type of device identifier.
+   */
+  BlueCherryZtpDeviceIdType type;
+
+  /**
+   * @brief The value of the device identifier.
+   */
+  BlueCherryZtpDeviceIdValue value;
+} BlueCherryZtpDeviceIdParam;
+
+/**
+ * @brief This structure represents a buffer and length of a CSR stored in PEM
+ * format.
+ */
+typedef struct {
+  /**
+   * @brief The buffer used to store a CSR.
+   */
+  unsigned char buffer[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+
+  /**
+   * @brief The data length of the CSR.
+   */
+  size_t length;
+} BlueCherryZtpCsr;
+
+/**
+ * @brief This structure represents the device identification parameters.
+ */
+typedef struct {
+  /**
+   * @brief The array of device identification parameters.
+   */
+  BlueCherryZtpDeviceIdParam param[BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS];
+
+  /**
+   * @brief The number of parameters in the list.
+   */
+  int count;
+} BlueCherryZtpDeviceId;
+
+/**
  * @brief The maximum number of pending outgoing messages.
  */
 static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
@@ -115,8 +246,7 @@ typedef enum {
   BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE,
   BLUECHERRY_STATE_CONNECTED_TIMED_OUT,
   BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK,
-  BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES,
-  BLUECHERRY_STATE_NOT_PROVISIONED
+  BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES
 } bluecherry_state;
 
 /**
@@ -196,6 +326,31 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.5;
  * @brief The maximum number of milliseconds to wait for a datagram to arrive on a socket.
  */
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
+
+/**
+ * @brief The buffer used to store a private key.
+ */
+static char ztp_pkeyBuf[BLUECHERRY_ZTP_PKEY_BUF_SIZE];
+
+/**
+ * @brief The buffer used to store a certificate.
+ */
+static char ztp_certBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+
+/**
+ * @brief The BlueCherry device ID received from the server.
+ */
+static char ztp_bcDevId[BLUECHERRY_ZTP_ID_LEN + 1];
+
+/**
+ * @brief The size of the buffer used for the CSR subject.
+ */
+static char ztp_subjBuf[BLUECHERRY_ZTP_SUBJ_BUF_SIZE];
+
+/**
+ * @brief The BlueCherry type ID associated with this firmware.
+ */
+static const char* bcTypeId;
 
 /**
  * @brief The BlueCherry CA root + intermediate certificate used for CoAP DTLS
@@ -279,6 +434,11 @@ typedef struct {
   mbedtls_x509_crt devcert;
 
   /**
+   * @brief Mbed TLS CSR creation object.
+   */
+  mbedtls_x509write_csr ztp_mbCsr;
+
+  /**
    * @brief The device key.
    */
   mbedtls_pk_context devkey;
@@ -287,6 +447,16 @@ typedef struct {
    * @brief The Mbed TLS delay context timer.
    */
   mbedtls_timing_delay_context timer;
+
+  /**
+   * @brief The device ZTP identification data.
+   */
+  BlueCherryZtpDeviceId ztp_devIdParams;
+
+  /**
+   * @brief The CSR context.
+   */
+  BlueCherryZtpCsr ztp_csr;
 
   /**
    * @brief The socket used to communicate with the BlueCherry cloud.

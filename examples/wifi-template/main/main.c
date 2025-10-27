@@ -20,21 +20,23 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <esp_log.h>
-#include <sdkconfig.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_chip_info.h>
 #include <esp_system.h>
+#include <esp_event.h>
+#include <sdkconfig.h>
 #include <nvs_flash.h>
 #include <esp_wifi.h>
-#include <esp_event.h>
+#include <inttypes.h>
+#include <esp_log.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "bluecherry.h"
 #include "credentials/wifi.h"
+
+#define BLUECHERRY_DEVICE_TYPE "walter01"
 
 /**
  * @brief The logging tag for this BlueCherry module.
@@ -386,7 +388,7 @@ void app_main(void)
   // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
 
   /* Initialize bluecherry with zero-touch provisioning */
-  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, "walter01",
+  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
                                       bluecherry_msg_handler, NULL, true, 30));
 
   while(true) {
