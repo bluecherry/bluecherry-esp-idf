@@ -36,6 +36,9 @@
 #include "bluecherry.h"
 #include "credentials/wifi.h"
 
+/**
+ * @brief The BlueCherry device type for this application. Required for ZTP.
+ */
 #define BLUECHERRY_DEVICE_TYPE "walter01"
 
 /**
@@ -314,6 +317,16 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
   ESP_LOGI(TAG, "Received MQTT message of length %d on topic %02X: %.*s", len, topic, len, data);
 }
 
+/**
+ * @brief Write a string to NVS.
+ *
+ * This function writes a string value to NVS under the specified key.
+ *
+ * @param key The key under which to store the string.
+ * @param value The string value to store.
+ *
+ * @return ESP_OK on success.
+ */
 esp_err_t nvs_write_str(const char* key, const char* value)
 {
   nvs_handle_t handle;
@@ -324,6 +337,17 @@ esp_err_t nvs_write_str(const char* key, const char* value)
   return ESP_OK;
 }
 
+/**
+ * @brief Read a string from NVS.
+ *
+ * This function reads a string value from NVS under the specified key.
+ *
+ * @param key The key under which the string is stored.
+ * @param buf The buffer to store the read string.
+ * @param len The length of the buffer.
+ *
+ * @return ESP_OK on success.
+ */
 esp_err_t nvs_read_str(const char* key, char* buf, size_t len)
 {
   nvs_handle_t handle;
@@ -336,6 +360,15 @@ esp_err_t nvs_read_str(const char* key, char* buf, size_t len)
   return err;
 }
 
+/**
+ * @brief Callback implementation for BlueCherry ZTP BIO handler.
+ *
+ * @param read True when reading, false when writing.
+ * @param secure True when handling the private key, false when handling the certificate.
+ * @param args Optional user arguments, key or certificate passed as arguments when writing.
+ *
+ * @return The certificate or key when reading, NULL when writing.
+ */
 static const char* bluecherry_ztp_bio_handler(bool read, bool secure, void* args)
 {
   static char devcert[4096];
@@ -385,11 +418,17 @@ void app_main(void)
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));
 
   /* Initialize bluecherry with pre-provisioned keys */
-  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
+  // while (!bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30)) {
+  //   ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
+  //   vTaskDelay(pdMS_TO_TICKS(5000));
+  // }
 
   /* Initialize bluecherry with zero-touch provisioning */
-  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
-                                      bluecherry_msg_handler, NULL, true, 30));
+  while(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
+                            bluecherry_msg_handler, NULL, true, 30) != ESP_OK) {
+    ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
 
   while(true) {
     ESP_LOGI(TAG, "Publishing message");
