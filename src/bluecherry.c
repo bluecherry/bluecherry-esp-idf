@@ -1366,25 +1366,25 @@ static bool _ztp_request_device_id()
   _ztp_cbor_t cbor;
 
   if(_ztp_cbor_init(&cbor, cborBuf, sizeof(cborBuf)) < 0) {
-    printf("Failed to init CBOR buffer\n");
+    ESP_LOGE(TAG, "Failed to init CBOR buffer");
     return false;
   };
 
   // Start the CBOR array
   if(_ztp_cbor_start_array(&cbor, 2) < 0) {
-    printf("Failed to start CBOR array\n");
+    ESP_LOGE(TAG, "Failed to start CBOR array");
     return false;
   }
 
   // Encode type ID value
   if(_ztp_cbor_encode_string(&cbor, bcTypeId) < 0) {
-    printf("Failed to encode typeId value\n");
+    ESP_LOGE(TAG, "Failed to encode typeId value");
     return false;
   }
 
   // Start the CBOR map (key-value pairs)
   if(_ztp_cbor_start_map(&cbor, _bluecherry_opdata.ztp_devIdParams.count) < 0) {
-    printf("Failed to start CBOR map\n");
+    ESP_LOGE(TAG, "Failed to start CBOR map");
     return false;
   }
 
@@ -1392,7 +1392,7 @@ static bool _ztp_request_device_id()
 
     int type = (int) _bluecherry_opdata.ztp_devIdParams.param[i].type;
     if(_ztp_cbor_encode_int(&cbor, type) < 0) {
-      printf("Failed to encode param type (%u)\n", type);
+      ESP_LOGE(TAG, "Failed to encode param type (%u)", type);
       return false;
     }
 
@@ -1401,7 +1401,7 @@ static bool _ztp_request_device_id()
       // Encode IMEI number (15 characters)
       uint64_t imei = strtoull(_bluecherry_opdata.ztp_devIdParams.param[i].value.imei, NULL, 10);
       if(_ztp_cbor_encode_uint64(&cbor, imei) < 0) {
-        printf("Failed to encode IMEI number\n");
+        ESP_LOGE(TAG, "Failed to encode IMEI number");
         return false;
       }
     } break;
@@ -1410,7 +1410,7 @@ static bool _ztp_request_device_id()
       // Encode MAC address (6 bytes)
       if(_ztp_cbor_encode_bytes(
              &cbor, (uint8_t*) _bluecherry_opdata.ztp_devIdParams.param[i].value.mac, 6) < 0) {
-        printf("Failed to encode MAC address\n");
+        ESP_LOGE(TAG, "Failed to encode MAC address");
         return false;
       }
     } break;
@@ -1419,7 +1419,7 @@ static bool _ztp_request_device_id()
       // Encode OOB challenge (64 bit unsigned int)
       uint64_t oobChallenge = _bluecherry_opdata.ztp_devIdParams.param[0].value.oobChallenge;
       if(_ztp_cbor_encode_uint64(&cbor, oobChallenge) < 0) {
-        printf("Failed to encode OOB challenge\n");
+        ESP_LOGE(TAG, "Failed to encode OOB challenge");
         return false;
       }
     } break;
@@ -1438,7 +1438,7 @@ static bool _ztp_request_device_id()
 
   ret = _ztp_cbor_decode_device_id(in_buf, in_len, ztp_bcDevId, sizeof(ztp_bcDevId));
   if(ret < 0) {
-    printf("Failed to decode device id: %d\n", ret);
+    ESP_LOGE(TAG, "Failed to decode device id: %d", ret);
     return false;
   }
 
@@ -1495,7 +1495,7 @@ static bool _ztp_generate_key_and_csr()
       mbedtls_x509write_csr_der(&_bluecherry_opdata.ztp_mbCsr, csrBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE,
                                 mbedtls_ctr_drbg_random, &_bluecherry_opdata.ctr_drbg);
   if(ret < 0) {
-    printf("Failed to write CSR: -0x%04X\n", -ret);
+    ESP_LOGE(TAG, "Failed to write CSR DER: -0x%04X\n", -ret);
     return _ztp_finish_csr_gen(false);
   }
 
@@ -1527,7 +1527,7 @@ static bool _ztp_request_signed_certificate()
 
   if(_ztp_cbor_encode_bytes(&cbor, _bluecherry_opdata.ztp_csr.buffer,
                             _bluecherry_opdata.ztp_csr.length) < 0) {
-    printf("Failed to encode CSR\n");
+    ESP_LOGE(TAG, "Failed to encode CSR");
     return false;
   }
 
@@ -1540,14 +1540,14 @@ static bool _ztp_request_signed_certificate()
   size_t decodedSize;
   ret = _ztp_cbor_decode_certificate(coapData, in_len, cborBuf, &decodedSize);
   if(ret < 0) {
-    printf("Failed to decode certificate: %d\n", ret);
+    ESP_LOGE(TAG, "Failed to decode certificate: %d", ret);
     return false;
   }
 
   // Parse the DER-encoded certificate
   ret = mbedtls_x509_crt_parse_der(&_bluecherry_opdata.devcert, cborBuf, decodedSize);
   if(ret < 0) {
-    printf("Failed to parse DER certificate, error code: -0x%x\n", -ret);
+    ESP_LOGE(TAG, "Failed to parse DER certificate, error code: -0x%x", -ret);
     mbedtls_x509_crt_free(&_bluecherry_opdata.devcert);
     return false;
   }
@@ -1559,7 +1559,7 @@ static bool _ztp_request_signed_certificate()
                                _bluecherry_opdata.devcert.raw.p, _bluecherry_opdata.devcert.raw.len,
                                cborBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE, &pemLen);
   if(ret < 0) {
-    printf("Failed to write PEM: -0x%04X\n", -ret);
+    ESP_LOGE(TAG, "Failed to write PEM: -0x%04X", -ret);
     mbedtls_x509_crt_free(&_bluecherry_opdata.devcert);
     return false;
   }
@@ -1727,7 +1727,8 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
 fail:
   _bluecherry_cleanup_network();
   _bluecherry_cleanup_mbedtls();
-  return false;
+  _bluecherry_opdata.ztp_devIdParams.count = 0;
+  return ESP_FAIL;
 }
 
 esp_err_t bluecherry_sync(bool blocking)
