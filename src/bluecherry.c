@@ -1,9 +1,11 @@
 /**
  * @file bluecherry.c
- * @author Daan Pape (daan@dptechnics.com)
+ * @author Daan Pape <daan@dptechnics.com>
+ * @author Thibo Verheyde <thibo@dptechnics.com>
+ * @author Arnoud Devoogdt <arnoud@dptechnics.com>
  * @brief This code connects to the BlueCherry platform.
  * @version 1.2.0
- * @date 2025-07-25
+ * @date 2025-10-27
  * @copyright Copyright (c) 2025 DPTechnics BV
  *
  * This program is free software: you can redistribute it and/or modify it under the terms of the
@@ -19,7 +21,6 @@
  */
 
 #include <bluecherry.h>
-#include <bc_ztp_cbor.h>
 
 /**
  * @brief The operational data used by the BlueCherry cloud  connection.
@@ -31,7 +32,78 @@ static _bluecherry_t _bluecherry_opdata = { 0 };
  */
 static const char* TAG = "[BlueCherry]";
 
+/**
+ * @brief The hostname of the BlueCherry cloud.
+ */
+static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
+
+/**
+ * @brief The port of the BlueCherry cloud.
+ */
+static const char* BLUECHERRY_PORT = "5684";
+
+/**
+ * @brief The port of the BlueCherry ZTP server.
+ */
+static const char* BLUECHERRY_ZTP_PORT = "5688";
+
+/**
+ * @brief The buffer used to store a private key.
+ */
+static char ztp_pkeyBuf[BLUECHERRY_ZTP_PKEY_BUF_SIZE];
+
+/**
+ * @brief The buffer used to store a certificate.
+ */
+static char ztp_certBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+
+/**
+ * @brief The BlueCherry device ID received from the server.
+ */
+static char ztp_bcDevId[BLUECHERRY_ZTP_ID_LEN + 1];
+
+/**
+ * @brief The size of the buffer used for the CSR subject.
+ */
+static char ztp_subjBuf[BLUECHERRY_ZTP_SUBJ_BUF_SIZE];
+
+/**
+ * @brief The BlueCherry type ID associated with this firmware.
+ */
+static const char* bcTypeId;
+
+/**
+ * @brief The BlueCherry CA root + intermediate certificate used for CoAP DTLS
+ * communication.
+ */
+static const char* BLUECHERRY_CA = "-----BEGIN CERTIFICATE-----\r\n\
+MIIBlTCCATqgAwIBAgICEAAwCgYIKoZIzj0EAwMwGjELMAkGA1UEBhMCQkUxCzAJ\r\n\
+BgNVBAMMAmNhMB4XDTI0MDMyNDEzMzM1NFoXDTQ0MDQwODEzMzM1NFowJDELMAkG\r\n\
+A1UEBhMCQkUxFTATBgNVBAMMDGludGVybWVkaWF0ZTBZMBMGByqGSM49AgEGCCqG\r\n\
+SM49AwEHA0IABJGFt28UrHlbPZEjzf4CbkvRaIjxDRGoeHIy5ynfbOHJ5xgBl4XX\r\n\
+hp/r8zOBLqSbu6iXGwgjp+wZJe1GCDi6D1KjZjBkMB0GA1UdDgQWBBR/rtuEomoy\r\n\
+49ovMAnj5Hpmk2gTGjAfBgNVHSMEGDAWgBR3Vw0Y1sUvMhkX7xySsX55tvsu8TAS\r\n\
+BgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAKBggqhkjOPQQDAwNJ\r\n\
+ADBGAiEApN7DmuufC/aqyt6g2Y8qOWg6AXFUyTcub8/Y28XY3KgCIQCs2VUXCPwn\r\n\
+k8jR22wsqNvZfbndpHthtnPqI5+yFXrY4A==\r\n\
+-----END CERTIFICATE-----\r\n\
+-----BEGIN CERTIFICATE-----\r\n\
+MIIBmDCCAT+gAwIBAgIUDjfXeosg0fphnshZoXgQez0vO5UwCgYIKoZIzj0EAwMw\r\n\
+GjELMAkGA1UEBhMCQkUxCzAJBgNVBAMMAmNhMB4XDTI0MDMyMzE3MzU1MloXDTQ0\r\n\
+MDQwNzE3MzU1MlowGjELMAkGA1UEBhMCQkUxCzAJBgNVBAMMAmNhMFkwEwYHKoZI\r\n\
+zj0CAQYIKoZIzj0DAQcDQgAEB00rHNthOOYyKj80cd/DHQRBGSbJmIRW7rZBNA6g\r\n\
+fbEUrY9NbuhGS6zKo3K59zYc5R1U4oBM3bj6Q7LJfTu7JqNjMGEwHQYDVR0OBBYE\r\n\
+FHdXDRjWxS8yGRfvHJKxfnm2+y7xMB8GA1UdIwQYMBaAFHdXDRjWxS8yGRfvHJKx\r\n\
+fnm2+y7xMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49\r\n\
+BAMDA0cAMEQCID7AcgACnXWzZDLYEainxVDxEJTUJFBhcItO77gcHPZUAiAu/ZMO\r\n\
+VYg4UI2D74WfVxn+NyVd2/aXTvSBp8VgyV3odA==\r\n\
+-----END CERTIFICATE-----\r\n";
+
+/**
+ * @brief Whether the task watchdog is enabled.
+ */
 static bool _watchdog = false;
+
 /**
  * @brief Tickle the task watchdog if enabled.
  *
@@ -528,6 +600,21 @@ static void _bluecherry_cleanup_network()
 }
 
 /**
+ * @brief Cleanup the current DTLS session (socket + SSL context only).
+ *
+ * This function closes the current socket and frees the SSL session state,
+ * without touching RNG, entropy, certificates, or SSL config.
+ *
+ * @return None.
+ */
+static void _bluecherry_cleanup_session()
+{
+  _bluecherry_cleanup_network();
+  mbedtls_ssl_free(&_bluecherry_opdata.ssl);
+  mbedtls_ssl_init(&_bluecherry_opdata.ssl);
+}
+
+/**
  * @brief Setup the Mbed TLS resources.
  *
  * This function sets up the Mbed TLS resources used by the BlueCherry connection.
@@ -629,40 +716,41 @@ static bool _bluecherry_configure_credentials(const char* caCert, const char* de
  */
 static bool _bluecherry_dtls_connect(const char* host, const char* port)
 {
+  bool success = false;
   struct addrinfo hints = { 0 };
+  struct addrinfo* res = NULL;
+  int ret;
+
+  _bluecherry_cleanup_session();
+
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
-  struct addrinfo* res = NULL;
-  int ret = getaddrinfo(host, port, &hints, &res);
+
+  ret = getaddrinfo(host, port, &hints, &res);
   if(ret != 0 || res == NULL) {
     ESP_LOGE(TAG, "DNS lookup failed: %d", ret);
-    if(res)
-      freeaddrinfo(res);
-    return false;
+    goto cleanup;
   }
 
   _bluecherry_opdata.sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if(_bluecherry_opdata.sock < 0) {
     ESP_LOGE(TAG, "socket() failed: %s", strerror(errno));
-    freeaddrinfo(res);
-    return false;
+    goto cleanup;
   }
 
   struct timeval timeout = { .tv_sec = 3, .tv_usec = 0 };
   setsockopt(_bluecherry_opdata.sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
   ret = connect(_bluecherry_opdata.sock, res->ai_addr, res->ai_addrlen);
-  freeaddrinfo(res);
   if(ret != 0) {
     ESP_LOGE(TAG, "connect() failed: %s", strerror(errno));
-    _bluecherry_cleanup_network();
-    return false;
+    goto cleanup;
   }
 
   ret = mbedtls_ssl_setup(&_bluecherry_opdata.ssl, &_bluecherry_opdata.ssl_conf);
   if(ret != 0) {
     ESP_LOGE(TAG, "Could not setup SSL context: -%04X", -ret);
-    return false;
+    goto cleanup;
   }
 
   mbedtls_ssl_set_timer_cb(&_bluecherry_opdata.ssl, &_bluecherry_opdata.timer,
@@ -671,28 +759,39 @@ static bool _bluecherry_dtls_connect(const char* host, const char* port)
   ret = mbedtls_ssl_set_hostname(&_bluecherry_opdata.ssl, host);
   if(ret != 0) {
     ESP_LOGE(TAG, "Could not set hostname: -%04X", -ret);
-    return false;
+    goto cleanup;
   }
 
   mbedtls_ssl_set_bio(&_bluecherry_opdata.ssl, &_bluecherry_opdata.sock, _bluecherry_dtls_send,
                       _bluecherry_dtls_recv, NULL);
 
-  time_t start = time(NULL);
-  while((ret = mbedtls_ssl_handshake(&_bluecherry_opdata.ssl)) != 0) {
-    if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-       ret == MBEDTLS_ERR_SSL_TIMEOUT) {
-      if(difftime(time(NULL), start) >= 30) {
-        ESP_LOGE(TAG, "DTLS handshake timeout");
-        return false;
+  {
+    time_t start = time(NULL);
+    while((ret = mbedtls_ssl_handshake(&_bluecherry_opdata.ssl)) != 0) {
+      if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+         ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+        if(difftime(time(NULL), start) >= 30) {
+          ESP_LOGE(TAG, "DTLS handshake timeout");
+          goto cleanup;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
       }
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+      ESP_LOGE(TAG, "DTLS handshake failed: -%04X", -ret);
+      goto cleanup;
     }
-    ESP_LOGE(TAG, "DTLS handshake failed: -%04X", -ret);
-    return false;
   }
 
-  return true;
+  success = true;
+
+cleanup:
+  if(res)
+    freeaddrinfo(res);
+
+  if(!success)
+    _bluecherry_cleanup_session();
+
+  return success;
 }
 
 #pragma endregion
@@ -816,6 +915,7 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
 
   for(uint8_t attempt = 1; attempt <= 4; ++attempt) {
     last_tx_time = time(NULL);
+    _tickleWatchdog();
 
     if(_bluecherry_mbed_dtls_write(data, data_len) < 0)
       return false;
@@ -917,39 +1017,301 @@ static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uin
 #pragma region ZTP
 
 /**
- * @brief Add a device ID parameter of string type.
+ * @brief Initializes the CBOR context.
  *
- * This function adds a device ID parameter of string type to the ZTP device ID parameters list.
+ * @param cbor CBOR context to initialize.
+ * @param buffer Output buffer to use.
+ * @param capacity Maximum size of the buffer.
  *
- * @param type The type of the device ID parameter.
- * @param str The string value of the device ID parameter.
- *
- * @return true if the parameter was added successfully, false otherwise.
+ * @return 0 on success, non-zero on failure.
  */
-static bool _ztp_add_device_id_parameter_string(bluecherry_ztp_device_id_type type, const char* str)
+static int _ztp_cbor_init(_ztp_cbor_t* cbor, uint8_t* buffer, size_t capacity)
 {
-  if(str == NULL ||
-     _bluecherry_opdata.ztp_devIdParams.count >= BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS) {
-    return false;
+  if(buffer == NULL || capacity == 0) {
+    return -1;
   }
 
-  switch(type) {
-  case BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI:
-    _bluecherry_opdata.ztp_devIdParams.param[_bluecherry_opdata.ztp_devIdParams.count].type =
-        BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI;
-    strncpy(_bluecherry_opdata.ztp_devIdParams.param[_bluecherry_opdata.ztp_devIdParams.count]
-                .value.imei,
-            str, BLUECHERRY_ZTP_IMEI_LEN);
-    _bluecherry_opdata.ztp_devIdParams.param[_bluecherry_opdata.ztp_devIdParams.count]
-        .value.imei[BLUECHERRY_ZTP_IMEI_LEN] = '\0';
-    _bluecherry_opdata.ztp_devIdParams.count += 1;
-    break;
+  cbor->buffer = buffer;
+  cbor->capacity = capacity;
+  cbor->position = 0;
 
-  default:
-    return false;
+  return 0;
+}
+
+/**
+ * @brief Returns the size of encoded data.
+ *
+ * @param cbor CBOR context.
+ *
+ * @return Size of encoded data.
+ */
+static size_t _ztp_cbor_size(const _ztp_cbor_t* cbor)
+{
+  return cbor->position;
+}
+
+/**
+ * @brief Writes a single byte to the CBOR buffer.
+ *
+ * @param cbor CBOR context.
+ * @param byte Byte to write.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_write_byte(_ztp_cbor_t* cbor, uint8_t byte)
+{
+  if(cbor->position < cbor->capacity) {
+    cbor->buffer[cbor->position++] = byte;
+    return 0; // Success
+  }
+  return -1; // Buffer overflow
+}
+
+/**
+ * @brief Writes a byte array to the CBOR buffer.
+ *
+ * @param cbor CBOR context.
+ * @param data Data to write.
+ * @param length Length of data to write.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_write_bytes(_ztp_cbor_t* cbor, const uint8_t* data, size_t length)
+{
+  if(cbor->position + length <= cbor->capacity) {
+    memcpy(&cbor->buffer[cbor->position], data, length);
+    cbor->position += length;
+    return 0; // Success
+  }
+  return -1; // Buffer overflow
+}
+
+/**
+ * @brief Encodes the type and value into CBOR format.
+ *
+ * @param cbor CBOR context.
+ * @param majorType Major type of the CBOR data.
+ * @param value Value to encode.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_encode_type_and_value(_ztp_cbor_t* cbor, uint8_t majorType, size_t value)
+{
+  if(value < 24) {
+    return _ztp_cbor_write_byte(cbor, (majorType << 5) | value);
+  } else if(value < 256) {
+    if(_ztp_cbor_write_byte(cbor, (majorType << 5) | 0x18) < 0)
+      return -1;
+    return _ztp_cbor_write_byte(cbor, (uint8_t) value);
+  } else if(value < 65536) {
+    if(_ztp_cbor_write_byte(cbor, (majorType << 5) | 0x19) < 0)
+      return -1;
+    uint8_t bytes[] = { (uint8_t) (value >> 8), (uint8_t) value };
+    return _ztp_cbor_write_bytes(cbor, bytes, 2);
+  }
+  return -1; // Larger values not supported
+}
+
+/**
+ * @brief Encodes a byte string into CBOR format.
+ *
+ * @param cbor CBOR context.
+ * @param data Data to encode.
+ * @param length Length of data to encode.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_encode_bytes(_ztp_cbor_t* cbor, const uint8_t* data, size_t length)
+{
+  if(_ztp_cbor_encode_type_and_value(cbor, 2, length) < 0)
+    return -1;                                      // Major type 2 (byte string)
+  return _ztp_cbor_write_bytes(cbor, data, length); // Write byte array to buffer
+}
+
+/**
+ * @brief Encodes a string into CBOR format.
+ *
+ * @param cbor CBOR context.
+ * @param str String to encode.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_encode_string(_ztp_cbor_t* cbor, const char* str)
+{
+  size_t len = strlen(str);
+  if(_ztp_cbor_encode_type_and_value(cbor, 3, len) < 0)
+    return -1; // Major type 3 (text string)
+  return _ztp_cbor_write_bytes(cbor, (const uint8_t*) str, len);
+}
+
+/**
+ * @brief Encodes a 64-bit unsigned integer into CBOR format.
+ *
+ * @param cbor CBOR context.
+ * @param value Value to encode.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_encode_uint64(_ztp_cbor_t* cbor, uint64_t value)
+{
+  if(_ztp_cbor_encode_type_and_value(cbor, 2, 8) < 0)
+    return -1;
+
+  uint8_t bytes[] = { (uint8_t) (value >> 56), (uint8_t) (value >> 48), (uint8_t) (value >> 40),
+                      (uint8_t) (value >> 32), (uint8_t) (value >> 24), (uint8_t) (value >> 16),
+                      (uint8_t) (value >> 8),  (uint8_t) value };
+
+  return _ztp_cbor_write_bytes(cbor, bytes, 8);
+}
+
+/**
+ * @brief Encodes a signed integer into CBOR format.
+ *
+ * @param cbor @brief CBOR context.
+ * @param value @brief Value to encode.
+ *
+ * @return @brief 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_encode_int(_ztp_cbor_t* cbor, int value)
+{
+  if(value >= 0) {
+    return _ztp_cbor_encode_type_and_value(cbor, 0,
+                                           (size_t) value); // Major type 0
+  } else {
+    return _ztp_cbor_encode_type_and_value(cbor, 1,
+                                           (size_t) (-value - 1)); // Major type 1
+  }
+}
+
+/**
+ * @brief Starts encoding an array into CBOR format.
+ *
+ * @param cbor @brief CBOR context.
+ * @param size @brief Expected size of the array.
+ *
+ * @return @brief 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_start_array(_ztp_cbor_t* cbor, size_t size)
+{
+  return _ztp_cbor_encode_type_and_value(cbor, 4, size); // Major type 4 (array)
+}
+
+/**
+ * @brief Starts encoding a map into CBOR format.
+ *
+ * @param cbor @brief CBOR context.
+ * @param size @brief Expected size of the map.
+ *
+ * @return @brief 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_start_map(_ztp_cbor_t* cbor, size_t size)
+{
+  return _ztp_cbor_encode_type_and_value(cbor, 5, size); // Major type 5 (map)
+}
+
+/**
+ * @brief Decodes a device ID from CBOR data.
+ *
+ * @param cbor_data @brief CBOR data to decode.
+ * @param cbor_size @brief Size of CBOR data.
+ * @param decoded_str @brief Buffer to store decoded device ID.
+ * @param decoded_size @brief Size of decoded device ID buffer.
+ *
+ * @return @brief 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_decode_device_id(const uint8_t* cbor_data, size_t cbor_size, char* decoded_str,
+                                      size_t decoded_size)
+{
+  if(cbor_size < 1 || !cbor_data) {
+    return -1; // CBOR data is invalid
   }
 
-  return true;
+  // Ensure initial byte is a text string (major type 3)
+  uint8_t initial_byte = cbor_data[0];
+  if((initial_byte >> 5) != 3) {
+    return -2; // CBOR data is not a text string
+  }
+
+  // Extract the length of the string
+  size_t length = 0;
+  uint8_t additional_info = initial_byte & 0x1F;
+
+  if(additional_info > 23) {
+    return -3; // String length unsupported
+  }
+
+  length = additional_info;
+  cbor_data++;
+  cbor_size--;
+
+  // Validate the length against the remaining CBOR data
+  if(length > cbor_size) {
+    return -4; // Incomplete CBOR data for string length
+  }
+
+  // Validate the length against the output buffer size
+  if(length >= decoded_size) {
+    return -5; // Decoded string buffer too small
+  }
+
+  // Copy the string into the output buffer and null-terminate it
+  memcpy(decoded_str, cbor_data, length);
+  decoded_str[length] = '\0';
+
+  return 0;
+}
+
+/**
+ * @brief Decodes a signed certificate from CBOR data.
+ *
+ * @param cbor_data @brief CBOR data to decode.
+ * @param cbor_size @brief Size of CBOR data.
+ * @param decoded_data @brief Buffer to store decoded certificate.
+ * @param decoded_len @brief Pointer to store size of decoded certificate.
+ *
+ * @return @brief 0 on success, non-zero on failure.
+ */
+static int _ztp_cbor_decode_certificate(const uint8_t* cbor_data, size_t cbor_size,
+                                        unsigned char* decoded_data, size_t* decoded_len)
+{
+  if(cbor_size < 1 || !cbor_data) {
+    return -1; // CBOR data is invalid
+  }
+
+  // Ensure initial byte is a byte string (major type 2)
+  uint8_t initial_byte = cbor_data[0];
+  if((initial_byte >> 5) != 2) {
+    return -2; // CBOR data is not a byte string
+  }
+
+  // Extract the length of the string
+  size_t length = 0;
+  size_t offset = 1;
+  uint8_t additional_info = initial_byte & 0x1F;
+
+  if(additional_info < 24) {
+    length = additional_info;
+  } else if(additional_info == 24) {
+    length = cbor_data[offset++];
+  } else if(additional_info == 25) {
+    length = (cbor_data[offset] << 8) | cbor_data[offset + 1];
+    offset += 2;
+  } else if(additional_info == 26) {
+    length = (cbor_data[offset] << 24) | (cbor_data[offset + 1] << 16) |
+             (cbor_data[offset + 2] << 8) | cbor_data[offset + 3];
+    offset += 4;
+  } else {
+    return -3; // Length not supported
+  }
+
+  if(offset + length > cbor_size) {
+    return -4; // Length exceeds buffer size
+  }
+
+  memcpy(decoded_data, cbor_data + offset, length);
+  *decoded_len = length;
+
+  return 0;
 }
 
 /**
@@ -989,40 +1351,6 @@ static bool _ztp_add_device_id_parameter_blob(bluecherry_ztp_device_id_type type
 }
 
 /**
- * @brief Add a device ID parameter of number type.
- *
- * This function adds a device ID parameter of number type to the ZTP device ID parameters list
- * (e.g., OOB challenge).
- *
- * @param type The type of the device ID parameter.
- * @param number The number value of the device ID parameter.
- *
- * @return true if the parameter was added successfully, false otherwise.
- */
-static bool _ztp_add_device_id_parameter_number(bluecherry_ztp_device_id_type type,
-                                                unsigned long long number)
-{
-  if(_bluecherry_opdata.ztp_devIdParams.count >= BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS) {
-    return false;
-  }
-
-  switch(type) {
-  case BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE:
-    _bluecherry_opdata.ztp_devIdParams.param[_bluecherry_opdata.ztp_devIdParams.count].type =
-        BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE;
-    _bluecherry_opdata.ztp_devIdParams.param[_bluecherry_opdata.ztp_devIdParams.count]
-        .value.oobChallenge = number;
-    _bluecherry_opdata.ztp_devIdParams.count += 1;
-    break;
-
-  default:
-    return false;
-  }
-
-  return true;
-}
-
-/**
  * @brief Request the device ID from the BlueCherry ZTP server.
  *
  * This function constructs a CBOR-encoded request containing the device type ID and
@@ -1035,27 +1363,27 @@ static bool _ztp_request_device_id()
 {
   int ret;
   uint8_t cborBuf[256];
-  ZTP_CBOR cbor;
+  _ztp_cbor_t cbor;
 
-  if(ztp_cbor_init(&cbor, cborBuf, sizeof(cborBuf)) < 0) {
+  if(_ztp_cbor_init(&cbor, cborBuf, sizeof(cborBuf)) < 0) {
     printf("Failed to init CBOR buffer\n");
     return false;
   };
 
   // Start the CBOR array
-  if(ztp_cbor_start_array(&cbor, 2) < 0) {
+  if(_ztp_cbor_start_array(&cbor, 2) < 0) {
     printf("Failed to start CBOR array\n");
     return false;
   }
 
   // Encode type ID value
-  if(ztp_cbor_encode_string(&cbor, bcTypeId) < 0) {
+  if(_ztp_cbor_encode_string(&cbor, bcTypeId) < 0) {
     printf("Failed to encode typeId value\n");
     return false;
   }
 
   // Start the CBOR map (key-value pairs)
-  if(ztp_cbor_start_map(&cbor, _bluecherry_opdata.ztp_devIdParams.count) < 0) {
+  if(_ztp_cbor_start_map(&cbor, _bluecherry_opdata.ztp_devIdParams.count) < 0) {
     printf("Failed to start CBOR map\n");
     return false;
   }
@@ -1063,7 +1391,7 @@ static bool _ztp_request_device_id()
   for(size_t i = 0; i < _bluecherry_opdata.ztp_devIdParams.count; i++) {
 
     int type = (int) _bluecherry_opdata.ztp_devIdParams.param[i].type;
-    if(ztp_cbor_encode_int(&cbor, type) < 0) {
+    if(_ztp_cbor_encode_int(&cbor, type) < 0) {
       printf("Failed to encode param type (%u)\n", type);
       return false;
     }
@@ -1072,7 +1400,7 @@ static bool _ztp_request_device_id()
     case BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI: {
       // Encode IMEI number (15 characters)
       uint64_t imei = strtoull(_bluecherry_opdata.ztp_devIdParams.param[i].value.imei, NULL, 10);
-      if(ztp_cbor_encode_uint64(&cbor, imei) < 0) {
+      if(_ztp_cbor_encode_uint64(&cbor, imei) < 0) {
         printf("Failed to encode IMEI number\n");
         return false;
       }
@@ -1080,7 +1408,7 @@ static bool _ztp_request_device_id()
 
     case BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC: {
       // Encode MAC address (6 bytes)
-      if(ztp_cbor_encode_bytes(
+      if(_ztp_cbor_encode_bytes(
              &cbor, (uint8_t*) _bluecherry_opdata.ztp_devIdParams.param[i].value.mac, 6) < 0) {
         printf("Failed to encode MAC address\n");
         return false;
@@ -1090,7 +1418,7 @@ static bool _ztp_request_device_id()
     case BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE: {
       // Encode OOB challenge (64 bit unsigned int)
       uint64_t oobChallenge = _bluecherry_opdata.ztp_devIdParams.param[0].value.oobChallenge;
-      if(ztp_cbor_encode_uint64(&cbor, oobChallenge) < 0) {
+      if(_ztp_cbor_encode_uint64(&cbor, oobChallenge) < 0) {
         printf("Failed to encode OOB challenge\n");
         return false;
       }
@@ -1103,12 +1431,12 @@ static bool _ztp_request_device_id()
 
   uint8_t in_buf[16];
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_devid(cborBuf, ztp_cbor_size(&cbor), in_buf, &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx_devid(cborBuf, _ztp_cbor_size(&cbor), in_buf, &in_len)) {
     ESP_LOGE("ZTP", "Failed to sync with ZTP COAP server");
     return false;
   }
 
-  ret = ztp_cbor_decode_device_id(in_buf, in_len, ztp_bcDevId, sizeof(ztp_bcDevId));
+  ret = _ztp_cbor_decode_device_id(in_buf, in_len, ztp_bcDevId, sizeof(ztp_bcDevId));
   if(ret < 0) {
     printf("Failed to decode device id: %d\n", ret);
     return false;
@@ -1125,11 +1453,9 @@ static bool _ztp_request_device_id()
  * in PEM format in the global ztp_pkeyBuf, and the CSR is stored in the _bluecherry_opdata
  * structure.
  *
- * @param rfEnabled A boolean indicating whether RF is enabled (not used in this function).
- *
  * @return true if the key pair and CSR were generated successfully, false otherwise.
  */
-static bool _ztp_generate_key_and_csr(bool rfEnabled)
+static bool _ztp_generate_key_and_csr()
 {
   int ret;
   uint8_t csrBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
@@ -1194,25 +1520,25 @@ static bool _ztp_request_signed_certificate()
   int ret;
   uint8_t cborBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
   uint8_t coapData[BLUECHERRY_ZTP_CERT_BUF_SIZE];
-  ZTP_CBOR cbor;
+  _ztp_cbor_t cbor;
 
-  ztp_cbor_init(&cbor, cborBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE);
+  _ztp_cbor_init(&cbor, cborBuf, BLUECHERRY_ZTP_CERT_BUF_SIZE);
   mbedtls_x509_crt_init(&_bluecherry_opdata.devcert);
 
-  if(ztp_cbor_encode_bytes(&cbor, _bluecherry_opdata.ztp_csr.buffer,
-                           _bluecherry_opdata.ztp_csr.length) < 0) {
+  if(_ztp_cbor_encode_bytes(&cbor, _bluecherry_opdata.ztp_csr.buffer,
+                            _bluecherry_opdata.ztp_csr.length) < 0) {
     printf("Failed to encode CSR\n");
     return false;
   }
 
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_sign(cborBuf, ztp_cbor_size(&cbor), coapData, &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx_sign(cborBuf, _ztp_cbor_size(&cbor), coapData, &in_len)) {
     ESP_LOGE("ZTP", "Failed to receive response from ZTP COAP server");
     return false;
   }
 
   size_t decodedSize;
-  ret = ztp_cbor_decode_certificate(coapData, in_len, cborBuf, &decodedSize);
+  ret = _ztp_cbor_decode_certificate(coapData, in_len, cborBuf, &decodedSize);
   if(ret < 0) {
     printf("Failed to decode certificate: %d\n", ret);
     return false;
@@ -1372,7 +1698,7 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
       goto fail;
     }
 
-    if(!_ztp_generate_key_and_csr(false)) {
+    if(!_ztp_generate_key_and_csr()) {
       ESP_LOGE(TAG, "(ZTP) Could not generate private key");
       goto fail;
     }

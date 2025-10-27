@@ -1,9 +1,11 @@
 /**
  * @file bluecherry.h
- * @author Daan Pape (daan@dptechnics.com)
+ * @author Daan Pape <daan@dptechnics.com>
+ * @author Thibo Verheyde <thibo@dptechnics.com>
+ * @author Arnoud Devoogdt <arnoud@dptechnics.com>
  * @brief This code connects to the BlueCherry platform.
  * @version 1.2.0
- * @date 2025-07-25
+ * @date 2025-10-27
  * @copyright Copyright (c) 2025 DPTechnics BV
  *
  * This program is free software: you can redistribute it and/or modify it under the terms of the
@@ -46,6 +48,8 @@
 #include <esp_err.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <netdb.h>
 #include <errno.h>
@@ -208,21 +212,6 @@ typedef enum {
 } _bluecherry_event_type;
 
 /**
- * @brief The hostname of the BlueCherry cloud.
- */
-static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
-
-/**
- * @brief The port of the BlueCherry cloud.
- */
-static const char* BLUECHERRY_PORT = "5684";
-
-/**
- * @brief The port of the BlueCherry ZTP server.
- */
-static const char* BLUECHERRY_ZTP_PORT = "5688";
-
-/**
  * @brief The maximum number of pending outgoing messages.
  */
 static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
@@ -266,58 +255,6 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.5;
  * @brief The maximum number of milliseconds to wait for a datagram to arrive on a socket.
  */
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
-
-/**
- * @brief The buffer used to store a private key.
- */
-static char ztp_pkeyBuf[BLUECHERRY_ZTP_PKEY_BUF_SIZE];
-
-/**
- * @brief The buffer used to store a certificate.
- */
-static char ztp_certBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
-
-/**
- * @brief The BlueCherry device ID received from the server.
- */
-static char ztp_bcDevId[BLUECHERRY_ZTP_ID_LEN + 1];
-
-/**
- * @brief The size of the buffer used for the CSR subject.
- */
-static char ztp_subjBuf[BLUECHERRY_ZTP_SUBJ_BUF_SIZE];
-
-/**
- * @brief The BlueCherry type ID associated with this firmware.
- */
-static const char* bcTypeId;
-
-/**
- * @brief The BlueCherry CA root + intermediate certificate used for CoAP DTLS
- * communication.
- */
-static const char* BLUECHERRY_CA = "-----BEGIN CERTIFICATE-----\r\n\
-MIIBlTCCATqgAwIBAgICEAAwCgYIKoZIzj0EAwMwGjELMAkGA1UEBhMCQkUxCzAJ\r\n\
-BgNVBAMMAmNhMB4XDTI0MDMyNDEzMzM1NFoXDTQ0MDQwODEzMzM1NFowJDELMAkG\r\n\
-A1UEBhMCQkUxFTATBgNVBAMMDGludGVybWVkaWF0ZTBZMBMGByqGSM49AgEGCCqG\r\n\
-SM49AwEHA0IABJGFt28UrHlbPZEjzf4CbkvRaIjxDRGoeHIy5ynfbOHJ5xgBl4XX\r\n\
-hp/r8zOBLqSbu6iXGwgjp+wZJe1GCDi6D1KjZjBkMB0GA1UdDgQWBBR/rtuEomoy\r\n\
-49ovMAnj5Hpmk2gTGjAfBgNVHSMEGDAWgBR3Vw0Y1sUvMhkX7xySsX55tvsu8TAS\r\n\
-BgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAKBggqhkjOPQQDAwNJ\r\n\
-ADBGAiEApN7DmuufC/aqyt6g2Y8qOWg6AXFUyTcub8/Y28XY3KgCIQCs2VUXCPwn\r\n\
-k8jR22wsqNvZfbndpHthtnPqI5+yFXrY4A==\r\n\
------END CERTIFICATE-----\r\n\
------BEGIN CERTIFICATE-----\r\n\
-MIIBmDCCAT+gAwIBAgIUDjfXeosg0fphnshZoXgQez0vO5UwCgYIKoZIzj0EAwMw\r\n\
-GjELMAkGA1UEBhMCQkUxCzAJBgNVBAMMAmNhMB4XDTI0MDMyMzE3MzU1MloXDTQ0\r\n\
-MDQwNzE3MzU1MlowGjELMAkGA1UEBhMCQkUxCzAJBgNVBAMMAmNhMFkwEwYHKoZI\r\n\
-zj0CAQYIKoZIzj0DAQcDQgAEB00rHNthOOYyKj80cd/DHQRBGSbJmIRW7rZBNA6g\r\n\
-fbEUrY9NbuhGS6zKo3K59zYc5R1U4oBM3bj6Q7LJfTu7JqNjMGEwHQYDVR0OBBYE\r\n\
-FHdXDRjWxS8yGRfvHJKxfnm2+y7xMB8GA1UdIwQYMBaAFHdXDRjWxS8yGRfvHJKx\r\n\
-fnm2+y7xMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49\r\n\
-BAMDA0cAMEQCID7AcgACnXWzZDLYEainxVDxEJTUJFBhcItO77gcHPZUAiAu/ZMO\r\n\
-VYg4UI2D74WfVxn+NyVd2/aXTvSBp8VgyV3odA==\r\n\
------END CERTIFICATE-----\r\n";
 
 typedef union {
   /**
@@ -387,6 +324,26 @@ typedef struct {
    */
   int count;
 } _bluecherry_ztp_device_id_t;
+
+/**
+ * @brief The CBOR context structure.
+ */
+typedef struct {
+  /**
+   * @brief Output buffer pointer.
+   */
+  uint8_t* buffer;
+
+  /**
+   * @brief Maximum size of the buffer.
+   */
+  size_t capacity;
+
+  /**
+   * @brief Current write position in the buffer.
+   */
+  size_t position;
+} _ztp_cbor_t;
 
 /**
  * @brief This structure represents a scheduled BlueCherry message.
