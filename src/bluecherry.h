@@ -103,12 +103,6 @@ extern "C" {
  */
 #define BLUECHERRY_ZTP_ID_LEN 8
 
-#define ZTP_SERV_ADDR "coap.bluecherry.io"
-#define ZTP_SERV_PORT "5688"
-#define ZTP_SERV_API_VERSION "v1"
-#define ZTP_SERV_DEVID_PATH "devid"
-#define ZTP_SERV_CSR_PATH "sign"
-
 /**
  * @brief The size of the CSR subject buffer.
  */
@@ -135,89 +129,15 @@ extern "C" {
 #define BLUECHERRY_ZTP_COAP_TIMEOUT 30
 
 /**
- * @brief This enumeration list all different types of device identification
- * parameters.
+ * @brief Header of the function that handles reading/writing of certificates and keys
+ * for zero-touch provisioning.
+ *
+ * @param read True when reading, false when writing.
+ * @param secure True when handling the private key, false when handling the certificate.
+ * @param args Optional user arguments, key or certificate passed as arguments when writing.
+ *
+ * @return The certificate or key when reading, NULL when writing.
  */
-typedef enum {
-  BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC = 0,
-  BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI,
-  BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE
-} BlueCherryZtpDeviceIdType;
-
-typedef union {
-  /**
-   * @brief Pointer to the BlueCherry Type ID, as this is always programmed in
-   * the application, no extra memory is required.
-   */
-  const char* bcTypeId;
-
-  /**
-   * @brief A MAC address used for authentication.
-   */
-  unsigned char mac[BLUECHERRY_ZTP_MAC_LEN];
-
-  /**
-   * @brief An IMEI number in ASCII format + 0-terminator.
-   */
-  char imei[BLUECHERRY_ZTP_IMEI_LEN + 1];
-
-  /**
-   * @brief A 64-bit OOB challenge.
-   */
-  unsigned long long oobChallenge;
-} BlueCherryZtpDeviceIdValue;
-
-/**
- * @brief This structure represents a device identifier.
- */
-typedef struct {
-  /**
-   * @brief The type of device identifier.
-   */
-  BlueCherryZtpDeviceIdType type;
-
-  /**
-   * @brief The value of the device identifier.
-   */
-  BlueCherryZtpDeviceIdValue value;
-} BlueCherryZtpDeviceIdParam;
-
-/**
- * @brief This structure represents a buffer and length of a CSR stored in PEM
- * format.
- */
-typedef struct {
-  /**
-   * @brief The buffer used to store a CSR.
-   */
-  unsigned char buffer[BLUECHERRY_ZTP_CERT_BUF_SIZE];
-
-  /**
-   * @brief The data length of the CSR.
-   */
-  size_t length;
-} BlueCherryZtpCsr;
-
-/**
- * @brief This structure represents the device identification parameters.
- */
-typedef struct {
-  /**
-   * @brief The array of device identification parameters.
-   */
-  BlueCherryZtpDeviceIdParam param[BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS];
-
-  /**
-   * @brief The number of parameters in the list.
-   */
-  int count;
-} BlueCherryZtpDeviceId;
-
-/**
- * @brief The maximum number of pending outgoing messages.
- */
-static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
-
 typedef const char* (*bluecherry_ztp_bio_handler_t)(bool read, bool secure, void* args);
 
 /**
@@ -235,6 +155,16 @@ typedef const char* (*bluecherry_ztp_bio_handler_t)(bool read, bool secure, void
  */
 typedef void (*bluecherry_msg_handler_t)(uint8_t topic, uint16_t len, const uint8_t* data,
                                          void* args);
+
+/**
+ * @brief This enumeration list all different types of device identification
+ * parameters.
+ */
+typedef enum {
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC = 0,
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_IMEI,
+  BLUECHERRY_ZTP_DEVICE_ID_TYPE_OOB_CHALLENGE
+} bluecherry_ztp_device_id_type;
 
 /**
  * @brief The different states the BlueCherry connection can be in.
@@ -286,6 +216,16 @@ static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
  * @brief The port of the BlueCherry cloud.
  */
 static const char* BLUECHERRY_PORT = "5684";
+
+/**
+ * @brief The port of the BlueCherry ZTP server.
+ */
+static const char* BLUECHERRY_ZTP_PORT = "5688";
+
+/**
+ * @brief The maximum number of pending outgoing messages.
+ */
+static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
 
 /**
  * @brief The priority used for automatically syncing with BlueCherry.
@@ -379,6 +319,75 @@ BAMDA0cAMEQCID7AcgACnXWzZDLYEainxVDxEJTUJFBhcItO77gcHPZUAiAu/ZMO\r\n\
 VYg4UI2D74WfVxn+NyVd2/aXTvSBp8VgyV3odA==\r\n\
 -----END CERTIFICATE-----\r\n";
 
+typedef union {
+  /**
+   * @brief Pointer to the BlueCherry Type ID, as this is always programmed in
+   * the application, no extra memory is required.
+   */
+  const char* bcTypeId;
+
+  /**
+   * @brief A MAC address used for authentication.
+   */
+  unsigned char mac[BLUECHERRY_ZTP_MAC_LEN];
+
+  /**
+   * @brief An IMEI number in ASCII format + 0-terminator.
+   */
+  char imei[BLUECHERRY_ZTP_IMEI_LEN + 1];
+
+  /**
+   * @brief A 64-bit OOB challenge.
+   */
+  unsigned long long oobChallenge;
+} _bluecherry_ztp_device_id_value_t;
+
+/**
+ * @brief This structure represents a device identifier.
+ */
+typedef struct {
+  /**
+   * @brief The type of device identifier.
+   */
+  bluecherry_ztp_device_id_type type;
+
+  /**
+   * @brief The value of the device identifier.
+   */
+  _bluecherry_ztp_device_id_value_t value;
+} _bluecherry_ztp_device_id_param_t;
+
+/**
+ * @brief This structure represents a buffer and length of a CSR stored in PEM
+ * format.
+ */
+typedef struct {
+  /**
+   * @brief The buffer used to store a CSR.
+   */
+  unsigned char buffer[BLUECHERRY_ZTP_CERT_BUF_SIZE];
+
+  /**
+   * @brief The data length of the CSR.
+   */
+  size_t length;
+} _bluecherry_ztp_csr_t;
+
+/**
+ * @brief This structure represents the device identification parameters.
+ */
+typedef struct {
+  /**
+   * @brief The array of device identification parameters.
+   */
+  _bluecherry_ztp_device_id_param_t param[BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS];
+
+  /**
+   * @brief The number of parameters in the list.
+   */
+  int count;
+} _bluecherry_ztp_device_id_t;
+
 /**
  * @brief This structure represents a scheduled BlueCherry message.
  */
@@ -451,12 +460,12 @@ typedef struct {
   /**
    * @brief The device ZTP identification data.
    */
-  BlueCherryZtpDeviceId ztp_devIdParams;
+  _bluecherry_ztp_device_id_t ztp_devIdParams;
 
   /**
    * @brief The CSR context.
    */
-  BlueCherryZtpCsr ztp_csr;
+  _bluecherry_ztp_csr_t ztp_csr;
 
   /**
    * @brief The socket used to communicate with the BlueCherry cloud.
@@ -565,9 +574,10 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
  *
  * This function will initialize the BlueCherry IoT module without zero-touch provisioning enabled.
  *
- * @param ztp_bio_handler
+ * @param ztp_bio_handler The handler used for reading/writing keys and certificates. This must be
+ * implemented by the application.
  * @param ztp_bio_handler_args Optional user pointer which is passed to the ZTP bio handler.
- * @param bc_device_type
+ * @param bc_device_type The BlueCherry device type string.
  * @param msg_handler The handler used for incoming messages or NULL to ignore them.
  * @param msg_handler_args Optional user pointer which is passed to the message handler.
  * @param auto_sync When set to true, the library will atomatically perform syncs in the background.

@@ -71,42 +71,6 @@ static void _bluecherry_sync_task(void* args)
   }
 }
 
-static int ztp_hardware_random_entropy_func(void* data, unsigned char* output, size_t len)
-{
-  esp_fill_random(output, len);
-  return 0;
-}
-
-static bool ztp_finish_csr_gen(bool result)
-{
-  mbedtls_pk_free(&_bluecherry_opdata.devkey);
-  mbedtls_entropy_free(&_bluecherry_opdata.entropy);
-  mbedtls_ctr_drbg_free(&_bluecherry_opdata.ctr_drbg);
-  mbedtls_x509write_csr_free(&_bluecherry_opdata.ztp_mbCsr);
-
-  if(!result) {
-    ztp_pkeyBuf[0] = '\0';
-    ztp_certBuf[0] = '\0';
-  }
-
-  return result;
-}
-
-static bool ztp_seed_random(bool rfEnabled)
-{
-  if(!rfEnabled) {
-    bootloader_random_enable();
-  }
-
-  int ret = mbedtls_ctr_drbg_seed(&_bluecherry_opdata.ctr_drbg, ztp_hardware_random_entropy_func,
-                                  &_bluecherry_opdata.entropy, NULL, 0);
-
-  if(!rfEnabled) {
-    bootloader_random_disable();
-  }
-  return ret == 0;
-}
-
 #pragma region OTA FUNCTIONS
 
 /**
@@ -505,6 +469,37 @@ static int _bluecherry_mbed_dtls_write(const unsigned char* buf, size_t len)
   } while(true);
 }
 
+/**
+ * @brief Finalize the CSR generation process.
+ *
+ * This function cleans up the resources used during the CSR generation process.
+ *
+ * @param result The result of the CSR generation process.
+ *
+ * @return true if the cleanup was successful, false otherwise.
+ */
+static bool _ztp_finish_csr_gen(bool result)
+{
+  mbedtls_pk_free(&_bluecherry_opdata.devkey);
+  mbedtls_entropy_free(&_bluecherry_opdata.entropy);
+  mbedtls_ctr_drbg_free(&_bluecherry_opdata.ctr_drbg);
+  mbedtls_x509write_csr_free(&_bluecherry_opdata.ztp_mbCsr);
+
+  if(!result) {
+    ztp_pkeyBuf[0] = '\0';
+    ztp_certBuf[0] = '\0';
+  }
+
+  return result;
+}
+
+/**
+ * @brief Cleanup the Mbed TLS resources.
+ *
+ * This function cleans up the Mbed TLS resources used by the BlueCherry connection.
+ *
+ * @return None.
+ */
 static void _bluecherry_cleanup_mbedtls()
 {
   mbedtls_ssl_free(&_bluecherry_opdata.ssl);
@@ -516,6 +511,13 @@ static void _bluecherry_cleanup_mbedtls()
   mbedtls_pk_free(&_bluecherry_opdata.devkey);
 }
 
+/**
+ * @brief Cleanup the network resources.
+ *
+ * This function cleans up the network resources used by the BlueCherry connection.
+ *
+ * @return None.
+ */
 static void _bluecherry_cleanup_network()
 {
   if(_bluecherry_opdata.sock > 0) {
@@ -525,6 +527,15 @@ static void _bluecherry_cleanup_network()
   }
 }
 
+/**
+ * @brief Setup the Mbed TLS resources.
+ *
+ * This function sets up the Mbed TLS resources used by the BlueCherry connection.
+ *
+ * @param mac Pointer to the MAC address used for seeding the RNG.
+ *
+ * @return true if the setup was successful, false otherwise.
+ */
 static bool _bluecherry_setup_mbedtls(const uint8_t* mac)
 {
   mbedtls_ssl_init(&_bluecherry_opdata.ssl);
@@ -557,6 +568,17 @@ static bool _bluecherry_setup_mbedtls(const uint8_t* mac)
   return true;
 }
 
+/**
+ * @brief Configure the Mbed TLS credentials.
+ *
+ * This function configures the Mbed TLS credentials used by the BlueCherry connection.
+ *
+ * @param caCert Pointer to the CA certificate in PEM format.
+ * @param devCert Pointer to the device certificate in PEM format, or NULL if not used.
+ * @param devKey Pointer to the device private key in PEM format, or NULL if not used.
+ *
+ * @return true if the configuration was successful, false otherwise.
+ */
 static bool _bluecherry_configure_credentials(const char* caCert, const char* devCert,
                                               const char* devKey)
 {
@@ -595,6 +617,16 @@ static bool _bluecherry_configure_credentials(const char* caCert, const char* de
   return true;
 }
 
+/**
+ * @brief Connect to the BlueCherry DTLS server.
+ *
+ * This function connects to the BlueCherry DTLS server using the provided host and port.
+ *
+ * @param host The hostname or IP address of the BlueCherry server.
+ * @param port The port number of the BlueCherry server.
+ *
+ * @return true if the connection was successful, false otherwise.
+ */
 static bool _bluecherry_dtls_connect(const char* host, const char* port)
 {
   struct addrinfo hints = { 0 };
@@ -741,6 +773,23 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
   return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief Common CoAP transmit and receive function for ZTP operations.
+ *
+ * This function handles the common logic for transmitting and receiving CoAP messages
+ * during the Zero Touch Provisioning (ZTP) process. It constructs the CoAP message with
+ * the provided header and payload, sends it over the DTLS connection, and waits for
+ * a response.
+ *
+ * @param tx_buf Pointer to the buffer containing the payload to transmit.
+ * @param tx_len Length of the payload to transmit.
+ * @param rx_buf Pointer to the buffer where the received data will be stored.
+ * @param rx_len Pointer to a variable where the length of the received data will be stored.
+ * @param header Pointer to the CoAP header to be used for the message.
+ * @param header_len Length of the CoAP header.
+ *
+ * @return true if the transmission and reception were successful, false otherwise.
+ */
 static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
                                              uint16_t* rx_len, const uint8_t* header,
                                              size_t header_len)
@@ -775,12 +824,6 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
       uint8_t temp_buf[1024];
       int ret = _bluecherry_mbed_dtls_read(temp_buf, sizeof(temp_buf));
 
-      printf("Received %d bytes: \n", ret);
-      for(int i = 0; i < ret; i++) {
-        printf("%02X ", temp_buf[i]);
-      }
-      printf("\n");
-
       if(ret > 0) {
         if(ret > 7) {
           memcpy(rx_buf, temp_buf + 7, ret - 7);
@@ -803,6 +846,20 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
   return false;
 }
 
+/**
+ * @brief CoAP transmit and receive function for requesting device ID.
+ *
+ * This function constructs and sends a CoAP message to request the device ID
+ * from the BlueCherry cloud server. It uses a predefined CoAP header for the
+ * device ID request and handles the transmission and reception of the message.
+ *
+ * @param tx_buf Pointer to the buffer containing the payload to transmit.
+ * @param tx_len Length of the payload to transmit.
+ * @param rx_buf Pointer to the buffer where the received data will be stored.
+ * @param rx_len Pointer to a variable where the length of the received data will be stored.
+ *
+ * @return true if the transmission and reception were successful, false otherwise.
+ */
 static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
                                             uint16_t* rx_len)
 {
@@ -823,6 +880,20 @@ static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, ui
   return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_len, header, sizeof(header));
 }
 
+/**
+ * @brief CoAP transmit and receive function for signing operations.
+ *
+ * This function constructs and sends a CoAP message to perform signing operations
+ * with the BlueCherry cloud server. It uses a predefined CoAP header for the
+ * signing request and handles the transmission and reception of the message.
+ *
+ * @param tx_buf Pointer to the buffer containing the payload to transmit.
+ * @param tx_len Length of the payload to transmit.
+ * @param rx_buf Pointer to the buffer where the received data will be stored.
+ * @param rx_len Pointer to a variable where the length of the received data will be stored.
+ *
+ * @return true if the transmission and reception were successful, false otherwise.
+ */
 static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
                                            uint16_t* rx_len)
 {
@@ -845,32 +916,17 @@ static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uin
 #pragma endregion
 #pragma region ZTP
 
-const char* ztp_get_priv_key()
-{
-  return ztp_pkeyBuf;
-}
-
-const unsigned char* ztp_get_csr()
-{
-  return _bluecherry_opdata.ztp_csr.buffer;
-}
-
-size_t ztp_get_csr_len()
-{
-  return _bluecherry_opdata.ztp_csr.length;
-}
-
-const char* ztp_get_cert()
-{
-  return ztp_certBuf;
-}
-
-void ztp_reset_device_id()
-{
-  _bluecherry_opdata.ztp_devIdParams.count = 0;
-}
-
-bool ztp_add_device_id_parameter_string(BlueCherryZtpDeviceIdType type, const char* str)
+/**
+ * @brief Add a device ID parameter of string type.
+ *
+ * This function adds a device ID parameter of string type to the ZTP device ID parameters list.
+ *
+ * @param type The type of the device ID parameter.
+ * @param str The string value of the device ID parameter.
+ *
+ * @return true if the parameter was added successfully, false otherwise.
+ */
+static bool _ztp_add_device_id_parameter_string(bluecherry_ztp_device_id_type type, const char* str)
 {
   if(str == NULL ||
      _bluecherry_opdata.ztp_devIdParams.count >= BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS) {
@@ -896,7 +952,19 @@ bool ztp_add_device_id_parameter_string(BlueCherryZtpDeviceIdType type, const ch
   return true;
 }
 
-bool ztp_add_device_id_parameter_blob(BlueCherryZtpDeviceIdType type, const unsigned char* blob)
+/**
+ * @brief Add a device ID parameter of blob type.
+ *
+ * This function adds a device ID parameter of blob type to the ZTP device ID parameters list
+ * (e.g., MAC address).
+ *
+ * @param type The type of the device ID parameter.
+ * @param blob The blob value of the device ID parameter.
+ *
+ * @return true if the parameter was added successfully, false otherwise.
+ */
+static bool _ztp_add_device_id_parameter_blob(bluecherry_ztp_device_id_type type,
+                                              const unsigned char* blob)
 {
   if(blob == NULL ||
      _bluecherry_opdata.ztp_devIdParams.count >= BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS) {
@@ -920,7 +988,19 @@ bool ztp_add_device_id_parameter_blob(BlueCherryZtpDeviceIdType type, const unsi
   return true;
 }
 
-bool ztp_add_device_id_parameter_number(BlueCherryZtpDeviceIdType type, unsigned long long number)
+/**
+ * @brief Add a device ID parameter of number type.
+ *
+ * This function adds a device ID parameter of number type to the ZTP device ID parameters list
+ * (e.g., OOB challenge).
+ *
+ * @param type The type of the device ID parameter.
+ * @param number The number value of the device ID parameter.
+ *
+ * @return true if the parameter was added successfully, false otherwise.
+ */
+static bool _ztp_add_device_id_parameter_number(bluecherry_ztp_device_id_type type,
+                                                unsigned long long number)
 {
   if(_bluecherry_opdata.ztp_devIdParams.count >= BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS) {
     return false;
@@ -942,7 +1022,16 @@ bool ztp_add_device_id_parameter_number(BlueCherryZtpDeviceIdType type, unsigned
   return true;
 }
 
-bool ztp_request_device_id()
+/**
+ * @brief Request the device ID from the BlueCherry ZTP server.
+ *
+ * This function constructs a CBOR-encoded request containing the device type ID and
+ * device ID parameters, sends it to the BlueCherry ZTP server via CoAP,
+ * and decodes the received device ID.
+ *
+ * @return true if the device ID was successfully requested and decoded, false otherwise.
+ */
+static bool _ztp_request_device_id()
 {
   int ret;
   uint8_t cborBuf[256];
@@ -1028,7 +1117,19 @@ bool ztp_request_device_id()
   return true;
 }
 
-bool ztp_generate_key_and_csr(bool rfEnabled)
+/**
+ * @brief Generate a key pair and CSR for ZTP.
+ *
+ * This function generates an EC key pair and creates a Certificate Signing Request (CSR)
+ * using the provided device type ID and device ID. The generated private key is stored
+ * in PEM format in the global ztp_pkeyBuf, and the CSR is stored in the _bluecherry_opdata
+ * structure.
+ *
+ * @param rfEnabled A boolean indicating whether RF is enabled (not used in this function).
+ *
+ * @return true if the key pair and CSR were generated successfully, false otherwise.
+ */
+static bool _ztp_generate_key_and_csr(bool rfEnabled)
 {
   int ret;
   uint8_t csrBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
@@ -1043,17 +1144,17 @@ bool ztp_generate_key_and_csr(bool rfEnabled)
 
   if(mbedtls_pk_setup(&_bluecherry_opdata.devkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) !=
      0) {
-    return ztp_finish_csr_gen(false);
+    return _ztp_finish_csr_gen(false);
   }
 
   if(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(_bluecherry_opdata.devkey),
                          mbedtls_ctr_drbg_random, &_bluecherry_opdata.ctr_drbg) != 0) {
-    return ztp_finish_csr_gen(false);
+    return _ztp_finish_csr_gen(false);
   }
 
   if(mbedtls_pk_write_key_pem(&_bluecherry_opdata.devkey, (unsigned char*) ztp_pkeyBuf,
                               BLUECHERRY_ZTP_PKEY_BUF_SIZE) != 0) {
-    return ztp_finish_csr_gen(false);
+    return _ztp_finish_csr_gen(false);
   }
 
   mbedtls_x509write_csr_set_md_alg(&_bluecherry_opdata.ztp_mbCsr, MBEDTLS_MD_SHA256);
@@ -1061,7 +1162,7 @@ bool ztp_generate_key_and_csr(bool rfEnabled)
 
   snprintf(ztp_subjBuf, BLUECHERRY_ZTP_SUBJ_BUF_SIZE, "C=BE,CN=%s.%s", bcTypeId, ztp_bcDevId);
   if(mbedtls_x509write_csr_set_subject_name(&_bluecherry_opdata.ztp_mbCsr, ztp_subjBuf) != 0) {
-    return ztp_finish_csr_gen(false);
+    return _ztp_finish_csr_gen(false);
   }
 
   ret =
@@ -1069,17 +1170,26 @@ bool ztp_generate_key_and_csr(bool rfEnabled)
                                 mbedtls_ctr_drbg_random, &_bluecherry_opdata.ctr_drbg);
   if(ret < 0) {
     printf("Failed to write CSR: -0x%04X\n", -ret);
-    return ztp_finish_csr_gen(false);
+    return _ztp_finish_csr_gen(false);
   }
 
   size_t offset = BLUECHERRY_ZTP_CERT_BUF_SIZE - ret;
   _bluecherry_opdata.ztp_csr.length = ret;
   memcpy(_bluecherry_opdata.ztp_csr.buffer, csrBuf + offset, _bluecherry_opdata.ztp_csr.length);
 
-  return ztp_finish_csr_gen(true);
+  return _ztp_finish_csr_gen(true);
 }
 
-bool ztp_request_signed_certificate()
+/**
+ * @brief Request a signed certificate from the BlueCherry ZTP server.
+ *
+ * This function sends the previously generated CSR to the BlueCherry ZTP server
+ * via CoAP, receives the signed certificate in DER format, converts it to PEM format,
+ * and stores it in the global ztp_certBuf.
+ *
+ * @return true if the signed certificate was successfully requested and stored, false otherwise.
+ */
+static bool _ztp_request_signed_certificate()
 {
   int ret;
   uint8_t cborBuf[BLUECHERRY_ZTP_CERT_BUF_SIZE];
@@ -1245,37 +1355,37 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
       ESP_LOGE(TAG, "(ZTP) Could not configure credentials");
       goto fail;
     }
-    if(!_bluecherry_dtls_connect(ZTP_SERV_ADDR, ZTP_SERV_PORT)) {
+    if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_ZTP_PORT)) {
       ESP_LOGE(TAG, "(ZTP) Could not connect to BlueCherry server");
       goto fail;
     }
 
     ESP_LOGI(TAG, "Connected to ZTP server");
 
-    if(!ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
+    if(!_ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
       ESP_LOGE(TAG, "(ZTP) Could not add MAC address as ZTP device ID parameter");
       goto fail;
     }
 
-    if(!ztp_request_device_id()) {
+    if(!_ztp_request_device_id()) {
       ESP_LOGE(TAG, "(ZTP) Could not request device ID");
       goto fail;
     }
 
-    if(!ztp_generate_key_and_csr(false)) {
+    if(!_ztp_generate_key_and_csr(false)) {
       ESP_LOGE(TAG, "(ZTP) Could not generate private key");
       goto fail;
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    if(!ztp_request_signed_certificate()) {
+    if(!_ztp_request_signed_certificate()) {
       ESP_LOGE(TAG, "(ZTP) Could not request signed certificate");
       goto fail;
     }
 
-    const char* new_cert = ztp_get_cert();
-    const char* new_key = ztp_get_priv_key();
+    const char* new_cert = ztp_certBuf;
+    const char* new_key = ztp_pkeyBuf;
 
     // Store the new credentials using the provided BIO handler
     ztp_bio_handler(false, false, (void*) new_cert);
