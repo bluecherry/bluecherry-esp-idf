@@ -1592,7 +1592,7 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
   }
 
   _bluecherry_opdata.out_queue =
-      xQueueCreate(BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES, sizeof(_bluecherry_msg_t));
+      xQueueCreate(CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES, sizeof(_bluecherry_msg_t));
   if(_bluecherry_opdata.out_queue == NULL) {
     ESP_LOGE(TAG, "Unable to create outgoing message queue");
     return ESP_FAIL;
@@ -1630,7 +1630,6 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     esp_task_wdt_init(&twdt_config);
 #endif
 #endif
-    esp_task_wdt_add(NULL);
     _watchdog = true;
   }
 
@@ -1747,28 +1746,41 @@ esp_err_t bluecherry_sync(bool blocking)
     return ESP_ERR_INVALID_STATE;
   }
 
-  int blocktime = blocking ? BLUECHERRY_AUTO_SYNC_SECONDS : 0;
+  const int64_t now = time(NULL);
+  const TickType_t wait_ticks = pdMS_TO_TICKS(200);
+  int blocktime = blocking ? wait_ticks : 0;
   _bluecherry_msg_t out_msg;
-  if(xQueuePeek(_bluecherry_opdata.out_queue, &out_msg, pdMS_TO_TICKS(blocktime * 1000)) ==
-     pdPASS) {
+
+  // Wait up to 200ms for an outgoing message to be available
+  if(xQueuePeek(_bluecherry_opdata.out_queue, &out_msg, blocktime) == pdPASS) {
+    // Transmit the message
     if(_bluecherry_coap_rxtx(&out_msg) == ESP_OK) {
+      // Remove the transmitted message from the queue
       if(xQueueReceive(_bluecherry_opdata.out_queue, &out_msg, 0) == pdPASS) {
-        ESP_LOGD(TAG, "Synchronized messages with cloud");
         free(out_msg.data);
       } else {
         ESP_LOGD(TAG, "Could not remove transmitted message from queue");
         return ESP_FAIL;
       }
+      ESP_LOGD(TAG, "Synchronized messages with cloud");
     } else {
       ESP_LOGE(TAG, "Could not sync payload with cloud");
       _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
       return ESP_ERR_NOT_FINISHED;
     }
   } else {
-    if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
-      ESP_LOGE(TAG, "Could not sync with cloud");
-      _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
-      return ESP_ERR_NOT_FINISHED;
+    // Nothing to send, perform periodic sync if needed
+    if(!blocking || ((now - _bluecherry_opdata.last_tx_time) >= CONFIG_BLUECHERRY_AUTO_SYNC_SEC)) {
+      // Perform an empty sync
+      if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "Could not sync with cloud");
+        _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+        return ESP_ERR_NOT_FINISHED;
+      }
+      ESP_LOGD(TAG, "Synchronized messages with cloud");
+    } else {
+      // No messages to send and no periodic sync needed
+      return ESP_OK;
     }
   }
 

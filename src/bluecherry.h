@@ -212,19 +212,9 @@ typedef enum {
 } _bluecherry_event_type;
 
 /**
- * @brief The maximum number of pending outgoing messages.
- */
-static const UBaseType_t BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES = 32;
-
-/**
  * @brief The priority used for automatically syncing with BlueCherry.
  */
 static const UBaseType_t BLUECHERRY_SP = 10;
-
-/**
- * @brief The period in seconds between automatic BlueCherry syncs.
- */
-static const uint8_t BLUECHERRY_AUTO_SYNC_SECONDS = 10;
 
 /**
  * @brief The size of the BlueCherry CoAP header.

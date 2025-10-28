@@ -1,0 +1,19 @@
+menu "BLUECHERRY Configuration"
+
+    config BLUECHERRY_AUTO_SYNC_SEC
+        int "Auto Sync Interval (seconds)"
+        default 10
+        range 1 3600
+        help
+            Set the interval in seconds for automatic synchronization when no messages are published.
+            Minimum is 1 second, maximum is 3600 seconds (1 hour).
+
+    config BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES
+        int "Max Pending Outgoing Messages"
+        default 32
+        range 1 1024
+        help
+            Configure the maximum number of pending outgoing messages.
+            This setting helps manage memory usage and message flow.
+
+endmenu
