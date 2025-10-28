@@ -135,6 +135,7 @@ static void _bluecherry_sync_task(void* args)
 
   while(true) {
     _tickleWatchdog();
+    vTaskDelay(pdMS_TO_TICKS(10));
     if(bluecherry_sync(block) == BLUECHERRY_SYNC_CONTINUE) {
       block = false;
     } else {
@@ -1607,15 +1608,6 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     goto fail;
   }
 
-  _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
-  if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_PORT)) {
-    ESP_LOGE(TAG, "Could not connect to BlueCherry server");
-    goto fail;
-  }
-
-  _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
-  ESP_LOGI(TAG, "BlueCherry DTLS session established");
-
   if(watchdog_timeout_seconds > 0) {
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
     esp_task_wdt_init(watchdog_timeout_seconds, true);
@@ -1642,12 +1634,12 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     }
   }
 
+  _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
   return ESP_OK;
 
 fail:
   _bluecherry_cleanup_network();
   _bluecherry_cleanup_mbedtls();
-  _bluecherry_opdata.state = BLUECHERRY_STATE_UNINITIALIZED;
   return ESP_FAIL;
 }
 
@@ -1732,12 +1724,25 @@ fail:
 
 esp_err_t bluecherry_sync(bool blocking)
 {
+  static int64_t lastRetryTimeUs = 0;
+  static uint32_t retryIntervalMs = 100;
+
+  // (re)connect if needed with exponential backoff (non-blocking)
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_AWAIT_CONNECTION) {
-    if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_PORT)) {
-      ESP_LOGE(TAG, "Could not connect to BlueCherry server");
+    int64_t nowUs = esp_timer_get_time();
+    int64_t elapsedMs = (nowUs - lastRetryTimeUs) / 1000;
+    if(elapsedMs >= retryIntervalMs) {
+      lastRetryTimeUs = nowUs;
+      if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_PORT)) {
+        ESP_LOGE(TAG, "Could not connect to BlueCherry server");
+        retryIntervalMs = (retryIntervalMs < 30000) ? retryIntervalMs * 2 : 30000;
+        return ESP_ERR_NOT_FINISHED;
+      }
+      _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
+      retryIntervalMs = 100;
+    } else {
       return ESP_ERR_NOT_FINISHED;
     }
-    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
   }
 
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED ||
