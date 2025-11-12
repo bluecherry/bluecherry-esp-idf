@@ -2,7 +2,7 @@
  * @file wifi.h
  * @author Daan Pape (daan@dptechnics.com)
  * @brief This code connects to the BlueCherry platform.
- * @version 1.3.0
+ * @version 1.3.1
  * @date 2025-07-25
  * @copyright Copyright (c) 2025 DPTechnics BV
  *

@@ -25,3 +25,12 @@
 
 - feat(ZTP): Zero Touch Provisioning integration ([#7](https://github.com/bluecherry/bluecherry-esp-idf/pull/7))
 
+## [V1.3.1](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.3.1)
+
+### Features
+
+- feat(Kconfig): added kconfig and removed watchdog from main thread ([#8](https://github.com/bluecherry/bluecherry-esp-idf/pull/8))
+
+### Fixes
+
+- fix(reconnection): improved reconnection handling for bluecherry sync ([#9](https://github.com/bluecherry/bluecherry-esp-idf/pull/9))
