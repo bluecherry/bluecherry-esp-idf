@@ -438,12 +438,12 @@ typedef struct {
   /**
    * @brief The current CoAP message id that is used.
    */
-  int32_t cur_message_id;
+  uint16_t cur_message_id;
 
   /**
    * @brief The last CoAP message id that was acknowledged from the cloud.
    */
-  int32_t last_acked_message_id;
+  uint16_t last_acked_message_id;
 
   /**
    * @brief The last CoAP transmission time.
