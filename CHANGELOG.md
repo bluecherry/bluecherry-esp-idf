@@ -34,3 +34,9 @@
 ### Fixes
 
 - fix(reconnection): improved reconnection handling for bluecherry sync ([#9](https://github.com/bluecherry/bluecherry-esp-idf/pull/9))
+
+## [V1.3.2](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.3.2)
+
+### Fixes
+
+- fix(CoAP): message id type uint16_t ([#11](https://github.com/bluecherry/bluecherry-esp-idf/pull/11))
