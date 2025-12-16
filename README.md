@@ -44,7 +44,7 @@ the `idf_components.yml` file inside the `main` folder of your project:
 ```yml
 dependencies:
   bluecherry/bluecherry:
-    version: ">=1.3.2"
+    version: ">=1.3.3"
 ```
 
 ### Connect to the platform

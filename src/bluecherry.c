@@ -4,7 +4,7 @@
  * @author Thibo Verheyde <thibo@dptechnics.com>
  * @author Arnoud Devoogdt <arnoud@dptechnics.com>
  * @brief This code connects to the BlueCherry platform.
- * @version 1.3.2
+ * @version 1.3.3
  * @date 2025-10-27
  * @copyright Copyright (c) 2025 DPTechnics BV
  *
@@ -1811,7 +1811,7 @@ esp_err_t bluecherry_sync(bool blocking)
 
   if(type == BLUECHERRY_COAP_TYPE_ACK) {
     if(msg_id != _bluecherry_opdata.cur_message_id) {
-      ESP_LOGE(TAG, "Received ACK for %" PRIu16 " instead of %" PRIu32 "", msg_id,
+      ESP_LOGE(TAG, "Received ACK for %" PRIu16 " instead of %" PRIu16 "", msg_id,
                _bluecherry_opdata.cur_message_id);
       return ESP_ERR_INVALID_STATE;
     }

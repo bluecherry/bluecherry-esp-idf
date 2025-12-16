@@ -40,3 +40,5 @@
 ### Fixes
 
 - fix(CoAP): message id type uint16_t ([#11](https://github.com/bluecherry/bluecherry-esp-idf/pull/11))
+
+## [V1.3.3](https://github.com/bluecherry/bluecherry-esp-idf/releases/tag/v1.3.3)
