@@ -16,8 +16,6 @@ menu "BLUECHERRY Configuration"
             Configure the maximum number of pending outgoing messages.
             This setting helps manage memory usage and message flow.
 
-            # components/ota_signer/Kconfig
-
     config CUSTOM_OTA_SIGNING_KEY
         string "Path to ED25519 Private Key (YubiKey/SSH)"
         default "~/.ssh/id_ed25519_OTA_update"
