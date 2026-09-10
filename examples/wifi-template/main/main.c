@@ -319,6 +319,62 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
 }
 
 /**
+ * @brief Watch OTA updates without taking any of the decisions.
+ *
+ * A handler is optional. This one exists purely to log, so it returns false
+ * everywhere and the library keeps deciding: an update downloads the moment it
+ * is offered and the device reboots the moment it is installed. Registering
+ * this changes nothing about how the device updates, which is the point —
+ * watching an update must not be able to stop one.
+ *
+ * To take a decision instead, return true from the event that carries it:
+ *
+ *   - BLUECHERRY_OTA_EVENT_AVAILABLE: return true and call
+ *     bluecherry_ota_start() when it suits — the machine is idle, mains power
+ *     is up, or it is 3am. The offer does not expire, so hours later is fine.
+ *     bluecherry_ota_abort() declines it instead.
+ *   - BLUECHERRY_OTA_EVENT_COMPLETE: return true and call esp_restart()
+ *     yourself once valves are closed and buffers flushed. The boot partition
+ *     is already set; until the restart the OLD firmware keeps running.
+ *
+ * Either way this runs on the bc_sync task and must not block — set a flag and
+ * let your own task act on it.
+ *
+ * @param event The OTA event.
+ * @param info Details for the event, valid only for this call.
+ * @param args A NULL pointer.
+ *
+ * @return False throughout: every decision stays with the library.
+ */
+static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherry_ota_info_t* info,
+                                   void* args)
+{
+  switch(event) {
+  case BLUECHERRY_OTA_EVENT_AVAILABLE:
+    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes", info->version, info->size);
+    break;
+
+  case BLUECHERRY_OTA_EVENT_STARTED:
+    ESP_LOGI(TAG, "Firmware v%d downloading", info->version);
+    break;
+
+  case BLUECHERRY_OTA_EVENT_PROGRESS:
+    ESP_LOGI(TAG, "OTA progress %lu / %lu bytes", info->bytes_received, info->size);
+    break;
+
+  case BLUECHERRY_OTA_EVENT_COMPLETE:
+    ESP_LOGI(TAG, "Firmware v%d installed; the library is about to reboot", info->version);
+    break;
+
+  case BLUECHERRY_OTA_EVENT_FAILED:
+    ESP_LOGE(TAG, "Firmware v%d failed, error code %u", info->version, info->error_code);
+    break;
+  }
+
+  return false;
+}
+
+/**
  * @brief Write a string to NVS.
  *
  * This function writes a string value to NVS under the specified key.
@@ -417,6 +473,11 @@ void app_main(void)
 
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));
+
+  /* Optional, and this handler only logs. With no handler at all — or with one
+   * that returns false, as this one does — the library downloads an offered
+   * update and reboots into it on its own. */
+  bluecherry_ota_set_handler(bluecherry_ota_handler, NULL);
 
   /* Initialize bluecherry with pre-provisioned keys */
   // while (!bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30)) {

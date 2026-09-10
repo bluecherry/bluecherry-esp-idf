@@ -35,6 +35,7 @@
 #include <mbedtls/error.h>
 #include <esp_partition.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
 #include <lwip/sockets.h>
 #include <esp_ota_ops.h>
@@ -42,6 +43,7 @@
 #include <mbedtls/pem.h>
 #include <mbedtls/pk.h>
 #include <esp_random.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_vfs.h>
 #include <esp_log.h>
@@ -82,6 +84,29 @@ extern "C" {
  * @brief Encrypted block size within flash.
  */
 #define ENCRYPTED_BLOCK_SIZE 16
+
+/**
+ * @brief Size of the priority slot holding one outgoing internal-channel frame.
+ *
+ * A macro, not the sum of BLUECHERRY_COAP_HEADER_SIZE and
+ * BLUECHERRY_MQTT_HEADER_SIZE below: those are `static const size_t`, which is
+ * not a constant expression in C and cannot size a struct member. Same reason
+ * every other array size in this header is a #define.
+ *
+ * 5 header + 2 framing + 128 payload. The largest internal event is INIT_INFO,
+ * whose worst case is about 83 bytes once its variable-length strings are
+ * counted; the payload budget is deliberately well clear of that so a longer
+ * MCU name or reset reason cannot silently push it over. Over budget is not a
+ * crash but it is worse than it looks: _bluecherry_publish_event returns
+ * ESP_ERR_INVALID_SIZE, the caller only debug-logs that, and the result is a
+ * silently missing INIT_INFO — losing the running-partition hash, which is the
+ * one field in it the server actually acts on.
+ *
+ * _bluecherry_publish_event bounds-checks against sizeof() rather than against
+ * this constant, so the two cannot drift apart dangerously.
+ */
+#define BLUECHERRY_EVENT_PAYLOAD_MAX 128
+#define BLUECHERRY_PENDING_EVENT_SIZE (5 + 2 + BLUECHERRY_EVENT_PAYLOAD_MAX)
 
 /**
  * @brief SPI flash sectors per erase block, usually large erase block is 32k/64k.
@@ -206,11 +231,280 @@ typedef enum {
  * @brief The possible types of BlueCherry events.
  */
 typedef enum {
-  BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE = 1,
-  BLUECHERRY_EVENT_TYPE_OTA_CHUNK = 2,
-  BLUECHERRY_EVENT_TYPE_OTA_FINISH = 3,
-  BLUECHERRY_EVENT_TYPE_OTA_ERROR = 4
+  // 1..3 are the OTA messages the cloud sends before it knows what this client
+  // speaks. It implements none of them: 1 is answered with the probe reply (see
+  // BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL) and 2 and 3 are discarded.
+  BLUECHERRY_EVENT_TYPE_OTA_PROBE = 1, // Server -> Client: the cloud's opening OTA message, which this client answers to announce the protocol it speaks.
+  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_CHUNK = 2, // Server -> Client: image data in a form this client does not accept. Discarded.
+  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_FINISH = 3, // Server -> Client: end of an image this client never accepted. Discarded.
+  BLUECHERRY_EVENT_TYPE_ERROR = 4, // Client -> Server: a topic 0x00 handler failed. Historically payload-less; a reason byte may be appended, see BLUECHERRY_OTA_ERROR_*.
+  // MOTA 5..8: modem firmware update. Not implemented in this client, but fully
+  // implemented in the Walter cellular firmware, where it shares otaSize,
+  // otaProgress and ota_buffer with the ESP32 OTA path. Never reuse these.
+  // MOTA RESERVED, 5
+  // MOTA RESERVED, 6
+  // MOTA RESERVED, 7
+  // MOTA RESERVED, 8
+  BLUECHERRY_EVENT_TYPE_PARTITION_HASH = 9, // Client -> Server: Sends the currently running partition hash to the server. Server can use this to verify if an OTA was received.
+  BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE = 10, // Server -> Client: Informs the client an OTA update is available. Server reports the total size, hash, and version number
+  BLUECHERRY_EVENT_TYPE_OTA_START = 11, // Client -> Server: Requests the start of the OTA update. Echoes back the version number so the server can verify it matches the intended update.
+  BLUECHERRY_EVENT_TYPE_OTA_CHUNK = 12, // Server -> Client: Sends a chunk of the OTA update
+  BLUECHERRY_EVENT_TYPE_OTA_VERIFIED = 13, // Client -> Server: Informs the server that the OTA update has been fully received and checksum has been verified. (ready for reboot)
+  BLUECHERRY_EVENT_TYPE_OTA_ERROR = 14, // Client -> Server: Informs the Server that an error occurred during the OTA update, and that the update should stop. Can be thrown at any time during the download, or at the verification step. (Server will re-try ota up until max 3 times)
+  BLUECHERRY_EVENT_TYPE_INIT_INFO = 15 // Client -> Server: Sends initial information about the client to the server.
 } _bluecherry_event_type;
+
+/**
+ * @brief Reason byte appended to BLUECHERRY_EVENT_TYPE_ERROR.
+ *
+ * BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL is the probe reply, and the only
+ * place in this client where a second OTA protocol is acknowledged at all: the
+ * cloud still serves an older generation of devices, so it opens every OTA with
+ * BLUECHERRY_EVENT_TYPE_OTA_PROBE, and answering that with [4][0xB2] is what
+ * tells it to use the protocol implemented here. Until it receives that reply it
+ * sends nothing this client accepts — which is what keeps older firmware safe.
+ *
+ * The reply must be EXACTLY those two bytes. A one-byte [4] is the historic
+ * payload-less error that Walter firmware emits on any topic 0x00 failure, and
+ * the length is all that keeps the two apart.
+ */
+#define BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL 0xB2
+
+/**
+ * @brief OTA error codes, sent as BLUECHERRY_EVENT_TYPE_OTA_ERROR.
+ */
+typedef enum {
+  BLUECHERRY_OTA_ERR_NO_PARTITION = 1,
+  BLUECHERRY_OTA_ERR_TOO_LARGE = 2,
+  BLUECHERRY_OTA_ERR_ERASE_FAILED = 3,
+  BLUECHERRY_OTA_ERR_WRITE_FAILED = 4,
+  BLUECHERRY_OTA_ERR_HASH_MISMATCH = 5,
+  BLUECHERRY_OTA_ERR_BAD_MAGIC = 6,
+  BLUECHERRY_OTA_ERR_SET_BOOT_FAILED = 7,
+  BLUECHERRY_OTA_ERR_APP_ABORTED = 8,
+  BLUECHERRY_OTA_ERR_CHUNK_OVERRUN = 9
+} bluecherry_ota_error_t;
+
+/**
+ * @brief Length of an image SHA-256, as reported in INIT_INFO and as carried by
+ * BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE and _VERIFIED.
+ */
+#define BLUECHERRY_PARTITION_HASH_LEN 32
+
+/**
+ * @brief INIT_INFO payload layout.
+ *
+ * Mandatory core, 36 bytes:
+ *   [0]       event type = 15
+ *   [1]       schema version = 1
+ *   [2..33]   running partition SHA-256
+ *   [34..35]  presence bitmap, uint16 little endian
+ *
+ * Optional fields follow in ascending bit order. Fixed-width fields carry their
+ * value directly; a string field is [1B length][that many UTF-8 bytes], with a
+ * zero length legal and meaning "empty", not "absent".
+ *
+ * They are PURELY INFORMATIONAL: the server logs them and never makes a
+ * decision on them. Only the hash is acted upon.
+ *
+ * Two rules for changing this list, and the difference matters:
+ *
+ *   - A field whose width is unchanged may be repurposed in place. The worst a
+ *     stale peer can then produce is a mislabelled value, never a misparse.
+ *     BLUECHERRY_INFO_BIT_TOTAL_HEAP was free heap and is now total heap.
+ *   - A field whose width changes must be RETIRED and the replacement given the
+ *     next free bit. Bit 2 was a one-byte reset reason and is now a string on
+ *     bit 10: reusing bit 2 would make a stale client's single byte decode as a
+ *     length-1 string that swallows the next field's first byte, and every
+ *     field after it would be silently wrong. Retired, a mismatched pair stops
+ *     dead at an unknown bit instead — a parser cannot locate anything past a
+ *     bit whose width it does not know. Bits are cheap; a silent misparse is
+ *     not.
+ */
+#define BLUECHERRY_INIT_INFO_SCHEMA 1
+
+#define BLUECHERRY_INFO_BIT_PLATFORM (1 << 0)    /* 1B  toolchain enum */
+#define BLUECHERRY_INFO_BIT_LIB_VERSION (1 << 1) /* 3B  major, minor, patch */
+/* Bit 2 is RETIRED (was a 1B esp_reset_reason()). Never reassign it. */
+#define BLUECHERRY_INFO_BIT_OTA_SLOT_SIZE (1 << 3) /* 4B  usable slot size, LE */
+#define BLUECHERRY_INFO_BIT_UPTIME (1 << 4)        /* 4B  seconds since boot, LE */
+#define BLUECHERRY_INFO_BIT_TOTAL_HEAP (1 << 5)    /* 4B  total heap bytes, LE */
+#define BLUECHERRY_INFO_BIT_APP_VERSION (1 << 6)   /* 1B len + UTF-8 */
+#define BLUECHERRY_INFO_BIT_LIB_NAME (1 << 7)      /* 1B len + UTF-8 */
+#define BLUECHERRY_INFO_BIT_MCU (1 << 8)           /* 1B len + UTF-8 */
+#define BLUECHERRY_INFO_BIT_OTA_SLOT (1 << 9)      /* 2B  running slot, target slot */
+#define BLUECHERRY_INFO_BIT_RESET_REASON (1 << 10) /* 1B len + UTF-8 */
+
+/**
+ * @brief Longest string this client will put in one INIT_INFO field.
+ *
+ * A field that does not fit the remaining buffer is dropped rather than
+ * truncated — a cleared presence bit is something the server renders correctly,
+ * whereas a half-written string would misalign every field after it.
+ */
+#define BLUECHERRY_INFO_STR_MAX 32
+
+/**
+ * @brief Which BlueCherry library this is, and its version.
+ *
+ * The name is the point: several libraries share every toolchain — BlueCherry
+ * on esp-idf, zephyr and linux, WalterModem on esp-idf and arduino — so the
+ * platform enum cannot identify the sender and a bare version number means
+ * nothing without it. A sibling library changes this one string.
+ */
+#define BLUECHERRY_LIB_NAME "BlueCherry"
+#define BLUECHERRY_LIB_VERSION_MAJOR 1
+#define BLUECHERRY_LIB_VERSION_MINOR 4
+#define BLUECHERRY_LIB_VERSION_PATCH 0
+
+/**
+ * @brief The MCU this was built for, as a string.
+ *
+ * ESP-IDF already defines CONFIG_IDF_TARGET as e.g. "esp32s3" in the
+ * force-included sdkconfig.h, so this needs no lookup table and resolves at
+ * compile time. A build without it simply omits the field.
+ */
+#ifdef CONFIG_IDF_TARGET
+#define BLUECHERRY_MCU CONFIG_IDF_TARGET
+#endif
+
+/**
+ * @brief ota_slot value meaning "not an OTA slot" — a factory boot, or a
+ * platform with no such concept.
+ *
+ * The field carries a platform-neutral slot index rather than an ESP partition
+ * subtype, so the zephyr and linux libraries do not have to fake an ESP
+ * encoding.
+ */
+#define BLUECHERRY_OTA_SLOT_NONE 0xFF
+
+/**
+ * @brief Client toolchain reported in INIT_INFO.
+ *
+ * The toolchain, not the board: Walter is ESP-IDF and has no code of its own
+ * here. ARDUINO is reported when that macro is defined, which is technically
+ * still an ESP-IDF wrapper but is the useful thing to know.
+ */
+typedef enum {
+  BLUECHERRY_PLATFORM_UNKNOWN = 0,
+  BLUECHERRY_PLATFORM_ESP_IDF = 1,
+  BLUECHERRY_PLATFORM_ARDUINO = 2,
+  BLUECHERRY_PLATFORM_NORDIC = 3,
+  BLUECHERRY_PLATFORM_ZEPHYR = 4,
+  BLUECHERRY_PLATFORM_LINUX = 5
+} bluecherry_platform_t;
+
+/**
+ * @brief Internal OTA state.
+ */
+typedef enum {
+  BLUECHERRY_OTA_STATE_IDLE = 0,
+  BLUECHERRY_OTA_STATE_OFFERED,     /* INITIALIZE received, waiting on the application */
+  BLUECHERRY_OTA_STATE_DOWNLOADING, /* START sent, chunks arriving */
+  BLUECHERRY_OTA_STATE_COMPLETE     /* verified, acked, boot partition set */
+} _bluecherry_ota_state;
+
+/**
+ * @brief OTA events reported to the application.
+ */
+typedef enum {
+  /**
+   * @brief An update is available; details are in bluecherry_ota_info_t.
+   *
+   * Carries a decision: return false and the library starts the download at
+   * once, return true and nothing happens until the application calls
+   * bluecherry_ota_start(). There is no timeout, so waiting hours, or until
+   * 3am, is perfectly fine.
+   */
+  BLUECHERRY_OTA_EVENT_AVAILABLE,
+
+  /** @brief The download has begun. Carries no decision. */
+  BLUECHERRY_OTA_EVENT_STARTED,
+
+  /**
+   * @brief Progress: bytes_received of size written so far. Carries no
+   * decision.
+   *
+   * Emitted once per batch that reaches flash, not once per received chunk —
+   * see bytes_received.
+   */
+  BLUECHERRY_OTA_EVENT_PROGRESS,
+
+  /**
+   * @brief The image is written, checked, acknowledged by the server, and the
+   * boot partition is set. The device keeps running the OLD firmware until it
+   * restarts.
+   *
+   * Carries a decision: return false and the library reboots at once, return
+   * true and the reboot is yours — close valves, flush buffers, finish a
+   * measurement, then call esp_restart(). The boot partition is already set, so
+   * nothing else from this library is needed.
+   *
+   * Runs on the bc_sync task, so it must not block — signal your own task.
+   */
+  BLUECHERRY_OTA_EVENT_COMPLETE,
+
+  /** @brief The update failed; error_code says why. Carries no decision. */
+  BLUECHERRY_OTA_EVENT_FAILED
+} bluecherry_ota_event_t;
+
+/**
+ * @brief Details accompanying a bluecherry_ota_event_t.
+ */
+typedef struct {
+  /** @brief BlueCherry firmware version being offered or installed. */
+  int8_t version;
+
+  /** @brief Total image size in bytes. */
+  uint32_t size;
+
+  /**
+   * @brief Expected image SHA-256, or all zeroes.
+   *
+   * All zeroes means the cloud holds no fingerprint for this build, so the
+   * download cannot be checked against one. The client still computes and
+   * reports the hash it ends up with, which is the value an operator would use
+   * to populate it.
+   */
+  uint8_t sha256[BLUECHERRY_PARTITION_HASH_LEN];
+
+  /**
+   * @brief Bytes written to flash so far, for BLUECHERRY_OTA_EVENT_PROGRESS.
+   *
+   * Advances a flash sector at a time, because that is when bytes actually
+   * reach the partition. Received chunks are an order of magnitude smaller and
+   * stage in RAM first, so this number moves once per flush and reaches size on
+   * the last one.
+   */
+  uint32_t bytes_received;
+
+  /** @brief A bluecherry_ota_error_t, for BLUECHERRY_OTA_EVENT_FAILED. */
+  uint8_t error_code;
+} bluecherry_ota_info_t;
+
+/**
+ * @brief Handler for OTA events.
+ *
+ * Return true when this call took the decision the event carries, false to
+ * leave it to the library. Two events carry one: BLUECHERRY_OTA_EVENT_AVAILABLE
+ * (start the download) and BLUECHERRY_OTA_EVENT_COMPLETE (reboot). For the
+ * other three the return value is ignored, so returning false there is the
+ * normal answer and means nothing is wrong.
+ *
+ * A handler that returns false everywhere is therefore equivalent to
+ * registering none at all: the library downloads on offer and reboots on
+ * install, and the handler is pure observation. That is deliberate — watching
+ * an update must not be able to stop one.
+ *
+ * @param event The event that occurred.
+ * @param info Details for the event, valid only for the duration of the call.
+ * @param args The argument given to bluecherry_ota_set_handler.
+ *
+ * @return True if the application took this event's decision, false to let the
+ * library apply its default.
+ */
+typedef bool (*bluecherry_ota_handler_t)(bluecherry_ota_event_t event,
+                                         const bluecherry_ota_info_t* info, void* args);
 
 /**
  * @brief The priority used for automatically syncing with BlueCherry.
@@ -495,6 +789,76 @@ typedef struct {
    * @brief The current OTA partition.
    */
   const esp_partition_t* otaPartition;
+
+  /**
+   * @brief OTA state.
+   */
+  _bluecherry_ota_state otaState;
+
+  /**
+   * @brief The image SHA-256 the cloud says this update should have.
+   *
+   * All zeroes means no fingerprint is on record, so the download cannot be
+   * checked against one. The hash is still computed and reported either way.
+   */
+  uint8_t otaExpectedHash[BLUECHERRY_PARTITION_HASH_LEN];
+
+  /**
+   * @brief True when otaExpectedHash is the all-zero "no fingerprint" sentinel.
+   */
+  bool otaUnverified;
+
+  /**
+   * @brief The BlueCherry firmware version being installed, echoed back to the
+   * server in START, VERIFIED and ERROR so it can tell which update we mean.
+   */
+  int8_t otaTargetVersion;
+
+  /**
+   * @brief Chunk size the server announced. Informational.
+   */
+  uint8_t otaChunkSize;
+
+  /**
+   * @brief Set while a VERIFIED is in flight. The send step commits the boot
+   * partition once that message is acknowledged, and not before.
+   */
+  bool otaAwaitingVerifiedAck;
+
+  /**
+   * @brief Priority slot for one outgoing internal-channel (topic 0x00) frame.
+   *
+   * Checked BEFORE out_queue in the send step, because bluecherry_sync sends
+   * one queued message per sync: a protocol reply left to queue behind
+   * CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES application publishes would
+   * be that many syncs away. Long enough, and the server would push an entire
+   * image in a form this client cannot accept before learning what it speaks.
+   *
+   * One slot is sufficient because every internal event is a reply the server
+   * then responds to, so only one is ever outstanding. A static buffer avoids
+   * the malloc/free dance of the application queue.
+   */
+  uint8_t pending_event[BLUECHERRY_PENDING_EVENT_SIZE];
+
+  /**
+   * @brief Length of the framed message in pending_event, 0 when empty.
+   */
+  size_t pending_event_len;
+
+  /**
+   * @brief The application's OTA handler, or NULL.
+   *
+   * NULL means the library decides for itself: start on offer, reboot on
+   * completion. So does a handler that returns false — the pointer says whether
+   * anyone is watching, the return value says who decides, and only the second
+   * of those can differ per event.
+   */
+  bluecherry_ota_handler_t ota_handler;
+
+  /**
+   * @brief Optional user pointer passed to the OTA handler.
+   */
+  void* ota_handler_args;
 } _bluecherry_t;
 
 /**
@@ -562,11 +926,60 @@ esp_err_t bluecherry_sync(bool blocking);
  * @param topic The topic of the message, passed as the topic index.
  * @param len The length of the topic payload data.
  * @param data The topic payload data.
- * @param copy True when the data must be copied.
  *
  * @return ESP_OK on success.
  */
 esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data);
+
+/**
+ * @brief Register a handler for OTA events.
+ *
+ * Entirely optional. With no handler the library starts a download as soon as
+ * one is offered and reboots as soon as it is installed, so an application that
+ * never calls this still receives updates.
+ *
+ * The two decisions are independently deferrable, and a handler takes only the
+ * ones it returns true for. One that returns true from
+ * BLUECHERRY_OTA_EVENT_AVAILABLE and false elsewhere controls when the download
+ * happens but lets the library reboot; one that returns true only from
+ * BLUECHERRY_OTA_EVENT_COMPLETE controls the reboot but downloads immediately;
+ * one that returns false throughout just watches.
+ *
+ * The handler runs on the bc_sync task and must not block.
+ *
+ * @param handler The handler, or NULL to hand control back to the library.
+ * @param args Optional user pointer passed to the handler.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* args);
+
+/**
+ * @brief Accept an offered update and begin the download.
+ *
+ * Only needed by a handler that returned true from
+ * BLUECHERRY_OTA_EVENT_AVAILABLE, which is what stops the library starting the
+ * download itself. Call it from that handler or long afterwards — the offer does
+ * not expire, so an application is free to wait for a quiet moment. If the cloud
+ * has withdrawn the update in the meantime the request simply goes unanswered.
+ *
+ * @return ESP_OK when the request was queued, ESP_ERR_INVALID_STATE when no
+ * update is currently on offer.
+ */
+esp_err_t bluecherry_ota_start(void);
+
+/**
+ * @brief Abandon the update in progress and tell the cloud why.
+ *
+ * The server counts this as one of three attempts and stops offering the update
+ * after the third.
+ *
+ * @param error_code A bluecherry_ota_error_t. Use
+ * BLUECHERRY_OTA_ERR_APP_ABORTED when the application is the one giving up.
+ *
+ * @return ESP_OK when the report was queued.
+ */
+esp_err_t bluecherry_ota_abort(uint8_t error_code);
 
 #ifdef __cplusplus
 };
