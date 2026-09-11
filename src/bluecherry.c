@@ -517,13 +517,18 @@ static bool _bluecherry_info_add_str(uint8_t* buf, size_t cap, size_t* n, const 
 }
 
 /**
- * @brief Send INIT_INFO: the running partition hash plus optional details.
+ * @brief Queue INIT_INFO: the running partition hash plus optional details.
  *
- * Sent after every successful connect, not only at boot. The hash is the part
- * the cloud acts on — it is how a reboot into new firmware is confirmed, and on
- * every connect it is what re-derives the device's recorded firmware version.
- * Everything behind the presence bitmap is informational and the server never
- * makes a decision on it.
+ * Queued once, from bluecherry_init, and sent on the first sync that has a
+ * session to send it on. It describes the image this device booted, which does
+ * not change while the device is running, so there is nothing for a later DTLS
+ * session to re-advertise. The hash is the part the cloud acts on — it is how a
+ * reboot into new firmware is confirmed. Everything behind the presence bitmap
+ * is informational and the server never makes a decision on it.
+ *
+ * Because it is queued before there is a connection, it sits in the priority
+ * slot across however many connection attempts it takes, and a reconnect must
+ * not discard it — see the slot handling in bluecherry_sync.
  *
  * Fields MUST be written in ascending presence-bit order: the server decodes
  * positionally and cannot recover from a field out of place.
@@ -2093,6 +2098,12 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     _watchdog = true;
   }
 
+  /* Queued once, here, rather than on every connect: it describes the image
+   * this device booted, which cannot change while it is running. It waits in
+   * the priority slot until there is a session to carry it. Queued before the
+   * sync task starts so the slot is already filled when that task first runs. */
+  _bluecherry_send_init_info();
+
   if(auto_sync) {
     BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync", 4096, NULL, BLUECHERRY_SP, NULL);
     if(ret != pdPASS) {
@@ -2214,16 +2225,25 @@ esp_err_t bluecherry_sync(bool blocking)
        * chunk 0 on a new session, so keeping otaProgress would resume writing
        * at a stale offset and quietly corrupt the image — and unfixable any
        * other way, because sequential chunks carry no offset to re-sync
-       * against. A protocol reply from the dead session is
-       * equally meaningless, so the priority slot goes with it. */
+       * against. A protocol reply from the dead session is equally
+       * meaningless, so the priority slot goes with it.
+       *
+       * INIT_INFO is the one exception. It is queued once at init and
+       * describes the image this device booted rather than anything about the
+       * session, so it is kept until it has actually been sent — otherwise a
+       * device that takes several attempts to connect would drop it. */
       _bluecherry_ota_reset();
-      _bluecherry_opdata.pending_event_len = 0;
+      if(_bluecherry_opdata.pending_event_len > 0) {
+        const uint8_t pending_event_type =
+            _bluecherry_opdata
+                .pending_event[BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE];
+        if(pending_event_type != BLUECHERRY_EVENT_TYPE_INIT_INFO) {
+          _bluecherry_opdata.pending_event_len = 0;
+        }
+      }
 
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;
-
-      /* Report the running image on every connect, not only at boot. */
-      _bluecherry_send_init_info();
     } else {
       return ESP_ERR_NOT_FINISHED;
     }

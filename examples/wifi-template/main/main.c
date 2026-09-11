@@ -319,26 +319,38 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
 }
 
 /**
- * @brief Watch OTA updates without taking any of the decisions.
+ * @brief Take the OTA decisions in the application instead of leaving them to the library.
  *
- * A handler is optional and this one only logs, so it returns false everywhere
- * and the library keeps deciding: download on offer, reboot on install. To take
- * a decision instead, return true from the event that carries it — see
- * bluecherry_ota_handler_t.
+ * Exactly two events carry a decision, and this handler takes both of them explicitly so that
+ * the two calls involved are visible and easy to move:
+ *
+ *  - AVAILABLE: bluecherry_ota_start() accepts the update. Returning true means "I have this",
+ *    so nothing is downloaded until that call is made — which is where you would instead stash
+ *    the offer and start it at 3am, on battery power, or once your machine is idle.
+ *  - COMPLETE: the new image is installed and the boot target is already set, so the only thing
+ *    left is when to restart. Returning true means the library will not do it for you.
+ *
+ * Returning false from either event hands that decision back: the library downloads on offer
+ * and restarts on install, which is what happens when no handler is registered at all. That is
+ * the point of the return value — a handler that only logs is free to return false everywhere
+ * and change nothing. The other three events are notifications and the return is ignored.
  *
  * @param event The OTA event.
  * @param info Details for the event, valid only for this call.
  * @param args A NULL pointer.
  *
- * @return False throughout: every decision stays with the library.
+ * @return True when this handler took the decision the event carries.
  */
 static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherry_ota_info_t* info,
                                    void* args)
 {
   switch(event) {
   case BLUECHERRY_OTA_EVENT_AVAILABLE:
-    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes", info->version, info->size);
-    break;
+    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes — accepting", info->version, info->size);
+    /* Accept it now. Delay this call instead to update at a moment that suits you; the offer
+     * stays open until you do, and bluecherry_ota_abort() declines it. */
+    bluecherry_ota_start();
+    return true;
 
   case BLUECHERRY_OTA_EVENT_STARTED:
     ESP_LOGI(TAG, "Firmware v%d downloading", info->version);
@@ -349,8 +361,11 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
     break;
 
   case BLUECHERRY_OTA_EVENT_COMPLETE:
-    ESP_LOGI(TAG, "Firmware v%d installed; the library is about to reboot", info->version);
-    break;
+    ESP_LOGI(TAG, "Firmware v%d installed — restarting", info->version);
+    /* The boot target is already set, so this is only about timing. Finish what your
+     * application is doing first if a restart here would interrupt it. */
+    esp_restart();
+    return true;
 
   case BLUECHERRY_OTA_EVENT_FAILED:
     ESP_LOGE(TAG, "Firmware v%d failed, error code %u", info->version, info->error_code);
@@ -460,9 +475,9 @@ void app_main(void)
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));
 
-  /* Optional, and this handler only logs. With no handler at all — or with one
-   * that returns false, as this one does — the library downloads an offered
-   * update and reboots into it on its own. */
+  /* Optional. This handler takes both OTA decisions itself so the calls are visible; drop it,
+   * or return false from those events, and the library downloads an offered update and reboots
+   * into it on its own. */
   bluecherry_ota_set_handler(bluecherry_ota_handler, NULL);
 
   /* Initialize bluecherry with pre-provisioned keys */
