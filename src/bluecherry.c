@@ -40,7 +40,7 @@ static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
 /**
  * @brief The port of the BlueCherry cloud.
  */
-static const char* BLUECHERRY_PORT = "5684";
+static const char* BLUECHERRY_PORT = "5686";
 
 /**
  * @brief The port of the BlueCherry ZTP server.
@@ -122,8 +122,6 @@ static void _tickleWatchdog(void)
  * This function implements the automatic BlueCherry syncronisation.
  *
  * @param args A NULL pointer.
- *
- * @return None.
  */
 static void _bluecherry_sync_task(void* args)
 {
@@ -144,7 +142,7 @@ static void _bluecherry_sync_task(void* args)
   }
 }
 
-#pragma region OTA FUNCTIONS
+#pragma region OTA
 
 /**
  * @brief Get the current OTA progress.
@@ -163,50 +161,8 @@ static float blueCherryGetOtaProgressPercent(void)
 }
 
 /**
- * @brief Process OTA init event
- *
- * This function prepares a OTA update and checks the announced update image size against
- * the update partition size.
- *
- * @param data The event data, being the announced size of the image
- * @param len The length of the update data.
- *
- * @return Whether we should emit an error BC event on next sync, in case announced size is
- * too large for partitioning.
- */
-static bool _processOtaInitializeEvent(uint8_t* data, uint16_t len)
-{
-  if(len != sizeof(uint32_t)) {
-    return true;
-  }
-
-  _bluecherry_opdata.otaSize = *((uint32_t*) data);
-
-  /* check if there is enough space on the update partition */
-  _bluecherry_opdata.otaPartition = esp_ota_get_next_update_partition(NULL);
-  if(!_bluecherry_opdata.otaPartition ||
-     _bluecherry_opdata.otaSize > _bluecherry_opdata.otaPartition->size ||
-     _bluecherry_opdata.otaSize == 0) {
-    ESP_LOGE(TAG, "OTA init: no OTA partition or size 0 or %lu > %lu", _bluecherry_opdata.otaSize,
-             _bluecherry_opdata.otaPartition->size);
-    return true;
-  }
-
-  /* initialize buffer and state */
-  _bluecherry_opdata.otaBufferPos = 0;
-  _bluecherry_opdata.otaProgress = 0;
-
-  ESP_LOGD(TAG, "OTA init: size %lu <= partition size %lu", _bluecherry_opdata.otaSize,
-           _bluecherry_opdata.otaPartition->size);
-
-  return false;
-}
-
-/**
  * @brief Write a flash sector to flash, erasing the block first if on an as of yet
  * uninitialized block
- *
- * @param None.
  *
  * @return True if succeeded, false if not.
  */
@@ -269,31 +225,508 @@ static bool _otaBufferToFlash(void)
 }
 
 /**
- * @brief Process OTA chunk event
+ * @brief Queue one internal-channel (topic 0x00) frame in the priority slot.
  *
- * This function accepts a chunk of the OTA update binary image. If the chunk is empty, the
- * BlueCherry cloud server signals a cancel of the upload in progress.
+ * The slot is checked before out_queue in the send step, so a protocol reply
+ * goes out on the very next sync instead of queueing behind the application's
+ * publishes. That matters most for the probe reply: any topic 0x00 frame sets
+ * want_resync, so the sync task loops again in milliseconds and the answer is
+ * back before the server has packed a single chunk.
  *
- * @param data The chunk data
- * @param len The length of the chunk data
+ * Only one internal event is ever outstanding — each is a reply the server then
+ * responds to — so a single slot is enough. A second call overwrites the first.
  *
- * @return Whether we should emit an error BC event on next sync, in case size so far
- * exceeds announced size, or if it is an empty chunk.
+ * @param payload The event payload, starting with the event type byte.
+ * @param len Payload length.
+ *
+ * @return ESP_OK on success.
  */
-static bool _processOtaChunkEvent(uint8_t* data, uint16_t len)
+static esp_err_t _bluecherry_publish_event(const uint8_t* payload, uint8_t len)
 {
-  if(!_bluecherry_opdata.otaSize || len == 0 ||
-     _bluecherry_opdata.otaProgress + len > _bluecherry_opdata.otaSize) {
-    ESP_LOGW(TAG, "OTA: cancelled because empty chunk or chunk beyond update size");
-    /**
-     * TODO: Replace hard reset with immediate response to bluecherry that OTA was aborted.
-     *
-     * Reason for hard reset: The cloud will continue to send OTA data and assume it
-     * completes successfully unless the connection is aborted.
-     */
-    // vTaskDelay(5000);
-    // esp_restart();
-    return true;
+  const size_t total = BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE + len;
+
+  if(total > sizeof(_bluecherry_opdata.pending_event)) {
+    ESP_LOGE(TAG, "Internal event of %uB does not fit the priority slot", len);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  uint8_t* p = _bluecherry_opdata.pending_event + BLUECHERRY_COAP_HEADER_SIZE;
+  p[0] = 0x00; /* internal channel */
+  p[1] = len;
+  memcpy(p + BLUECHERRY_MQTT_HEADER_SIZE, payload, len);
+
+  _bluecherry_opdata.pending_event_len = total;
+  return ESP_OK;
+}
+
+/**
+ * @brief Report an OTA event to the application, if it registered a handler.
+ *
+ * Two gates: the NULL check answers "is anyone watching" and the return value
+ * answers "who decides this event". Only the second can differ per event, so a
+ * handler registered purely to log cannot accidentally stop a device updating.
+ *
+ * @return True when the application took this event's decision, false when the
+ * library should apply its own default.
+ */
+static bool _bluecherry_ota_notify(bluecherry_ota_event_t event, uint8_t error_code)
+{
+  if(_bluecherry_opdata.ota_handler == NULL) {
+    return false;
+  }
+
+  bluecherry_ota_info_t info = {
+    .version = _bluecherry_opdata.otaTargetVersion,
+    .size = _bluecherry_opdata.otaSize,
+    .bytes_received = _bluecherry_opdata.otaProgress,
+    .error_code = error_code,
+  };
+  memcpy(info.sha256, _bluecherry_opdata.otaExpectedHash, BLUECHERRY_PARTITION_HASH_LEN);
+
+  return _bluecherry_opdata.ota_handler(event, &info, _bluecherry_opdata.ota_handler_args);
+}
+
+/**
+ * @brief Flush the staging buffer to flash and report the progress it made.
+ *
+ * The only place a progress event is emitted: otaProgress advances nowhere but
+ * in _otaBufferToFlash, so tying the event to arriving chunks instead would
+ * repeat the same byte count for a whole sector's worth of them.
+ *
+ * @return True if the flush succeeded, false if the write failed.
+ */
+static bool _bluecherry_ota_flush(void)
+{
+  if(!_otaBufferToFlash()) {
+    return false;
+  }
+
+  ESP_LOGI(TAG, "OTA: %lu / %lu bytes written (%.2f%%)", _bluecherry_opdata.otaProgress,
+           _bluecherry_opdata.otaSize, blueCherryGetOtaProgressPercent());
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_PROGRESS, 0);
+  return true;
+}
+
+/**
+ * @brief Clear all OTA transfer state.
+ */
+static void _bluecherry_ota_reset(void)
+{
+  _bluecherry_opdata.otaState = BLUECHERRY_OTA_STATE_IDLE;
+  _bluecherry_opdata.otaSize = 0;
+  _bluecherry_opdata.otaProgress = 0;
+  _bluecherry_opdata.otaBufferPos = 0;
+  memset(_bluecherry_opdata.otaExpectedHash, 0, BLUECHERRY_PARTITION_HASH_LEN);
+}
+
+/**
+ * @brief Abandon the transfer, tell the cloud why, and inform the application.
+ */
+static void _bluecherry_ota_fail(uint8_t error_code)
+{
+  ESP_LOGE(TAG, "OTA: failing with code %u", error_code);
+
+  uint8_t payload[3] = { BLUECHERRY_EVENT_TYPE_OTA_ERROR,
+                         (uint8_t) _bluecherry_opdata.otaTargetVersion, error_code };
+  _bluecherry_publish_event(payload, sizeof(payload));
+
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_FAILED, error_code);
+  _bluecherry_ota_reset();
+}
+
+/**
+ * @brief Finish the image and report it verified.
+ *
+ * Ordering is load-bearing, not incidental:
+ *
+ *   1. write the withheld 16-byte header  -> image complete, still NOT bootable
+ *   2. hash the partition and compare     -> mismatch: report and give up
+ *   3. send VERIFIED                      -> committed only once acked
+ *
+ * The boot partition is NOT set here but in _bluecherry_ota_commit, once the
+ * server has acknowledged the VERIFIED, so an unexpected reset in between boots
+ * the OLD image and the server simply retries. Committing first is what lets a
+ * device reboot into firmware the cloud never learned about.
+ *
+ * The hash is read back from flash rather than accumulated over the arriving
+ * bytes, so it attests to what is actually stored, and it is exactly the
+ * SHA-256 ESP-IDF appends to the image — the same value the cloud holds in
+ * ota_updates.firmware_fingerprint.
+ */
+static void _bluecherry_ota_verify(void)
+{
+  /* 1. Enable the partition: write the stashed first bytes. */
+  if(esp_partition_write(_bluecherry_opdata.otaPartition, 0,
+                         (uint32_t*) _bluecherry_opdata.otaSkipBuffer,
+                         ENCRYPTED_BLOCK_SIZE) != ESP_OK) {
+    ESP_LOGE(TAG, "OTA: could not write the image header");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_WRITE_FAILED);
+    return;
+  }
+
+  uint8_t header[ENCRYPTED_BLOCK_SIZE];
+  if(esp_partition_read(_bluecherry_opdata.otaPartition, 0, (uint32_t*) header,
+                        ENCRYPTED_BLOCK_SIZE) != ESP_OK) {
+    ESP_LOGE(TAG, "OTA: could not read back the image header");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_WRITE_FAILED);
+    return;
+  }
+  if(header[0] != ESP_IMAGE_HEADER_MAGIC) {
+    ESP_LOGE(TAG, "OTA: magic header missing on the partition");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_BAD_MAGIC);
+    return;
+  }
+
+  /* 2. Hash what is actually in flash. */
+  uint8_t actual[BLUECHERRY_PARTITION_HASH_LEN];
+  if(esp_partition_get_sha256(_bluecherry_opdata.otaPartition, actual) != ESP_OK) {
+    ESP_LOGE(TAG, "OTA: could not hash the written partition");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_HASH_MISMATCH);
+    return;
+  }
+
+  if(!_bluecherry_opdata.otaUnverified &&
+     memcmp(actual, _bluecherry_opdata.otaExpectedHash, BLUECHERRY_PARTITION_HASH_LEN) != 0) {
+    ESP_LOGE(TAG, "OTA: hash mismatch, the image in flash is not the one announced");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_HASH_MISMATCH);
+    return;
+  }
+
+  /* 3. Report it. In unverified mode there was nothing to compare against, but
+   * the hash is still sent: it is the value an operator needs to populate
+   * ota_updates.firmware_fingerprint and turn this into a verified update. */
+  uint8_t payload[2 + BLUECHERRY_PARTITION_HASH_LEN];
+  payload[0] = BLUECHERRY_EVENT_TYPE_OTA_VERIFIED;
+  payload[1] = (uint8_t) _bluecherry_opdata.otaTargetVersion;
+  memcpy(payload + 2, actual, BLUECHERRY_PARTITION_HASH_LEN);
+
+  if(_bluecherry_publish_event(payload, sizeof(payload)) != ESP_OK) {
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_WRITE_FAILED);
+    return;
+  }
+
+  _bluecherry_opdata.otaState = BLUECHERRY_OTA_STATE_AWAITING_VERIFIED;
+  ESP_LOGI(TAG, "OTA: image verified, reporting to the cloud before committing");
+}
+
+/**
+ * @brief Commit the new image once the cloud has acknowledged the VERIFIED.
+ *
+ * Called from the send step, which knows the message was acknowledged because
+ * _bluecherry_coap_rxtx only returns ESP_OK on an ACK. This is the single
+ * irreversible step in the whole flow.
+ */
+static void _bluecherry_ota_commit(void)
+{
+  if(esp_ota_set_boot_partition(_bluecherry_opdata.otaPartition) != ESP_OK) {
+    ESP_LOGE(TAG, "OTA: could not set the boot partition");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_SET_BOOT_FAILED);
+    return;
+  }
+
+  _bluecherry_opdata.otaState = BLUECHERRY_OTA_STATE_COMPLETE;
+  ESP_LOGI(TAG, "OTA: firmware v%d installed and acknowledged; boot partition set",
+           _bluecherry_opdata.otaTargetVersion);
+
+  /* Nobody watching, or watching without taking the decision: reboot now. An
+   * application that says it owns the moment keeps running the old firmware
+   * until it reboots, which is the point of saying so. */
+  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_COMPLETE, 0)) {
+    ESP_LOGI(TAG, "OTA: rebooting into the new firmware");
+    esp_restart();
+  }
+}
+
+/**
+ * @brief Map a partition to a platform-neutral OTA slot index.
+ *
+ * ESP subtypes OTA_0..OTA_15 become 0..15; a factory or test partition, or no
+ * partition at all, becomes BLUECHERRY_OTA_SLOT_NONE. The wire carries the
+ * index rather than the subtype so a zephyr or linux library does not have to
+ * invent ESP encodings.
+ */
+static uint8_t _bluecherry_ota_slot_index(const esp_partition_t* part)
+{
+  if(part == NULL || part->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
+     part->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+    return BLUECHERRY_OTA_SLOT_NONE;
+  }
+  return (uint8_t) (part->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
+}
+
+/**
+ * @brief Why the device last booted, as a string.
+ *
+ * A string rather than the raw esp_reset_reason_t so every library is
+ * self-describing and the cloud needs no per-platform lookup table — the enum
+ * values differ between ESP-IDF, Zephyr and nRF Connect.
+ *
+ * Only the reasons that exist across the IDF versions this library claims to
+ * support are named; ESP_RST_USB, _JTAG and friends arrived in 5.0 and would
+ * break a 4.x build, so they fall through to "unknown" rather than being
+ * listed. Widen the switch if the declared IDF floor is ever raised.
+ */
+static const char* _bluecherry_reset_reason_str(void)
+{
+  switch(esp_reset_reason()) {
+    case ESP_RST_POWERON:
+      return "poweron";
+    case ESP_RST_EXT:
+      return "ext";
+    case ESP_RST_SW:
+      return "sw";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "int_wdt";
+    case ESP_RST_TASK_WDT:
+      return "task_wdt";
+    case ESP_RST_WDT:
+      return "wdt";
+    case ESP_RST_DEEPSLEEP:
+      return "deepsleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * @brief Append a [1B length][UTF-8] INIT_INFO field, or drop it if it will not
+ * fit.
+ *
+ * Returns true when the field was written, so the caller can set its presence
+ * bit only then. Dropping is the safe failure: a cleared bit is something the
+ * server renders correctly, whereas a half-written string would misalign every
+ * field after it — the parser locates fields positionally and cannot resync.
+ */
+static bool _bluecherry_info_add_str(uint8_t* buf, size_t cap, size_t* n, const char* s)
+{
+  size_t len = strnlen(s, BLUECHERRY_INFO_STR_MAX);
+  if(*n + 1 + len > cap) {
+    ESP_LOGW(TAG, "INIT_INFO field \"%s\" dropped: only %uB left", s, (unsigned) (cap - *n));
+    return false;
+  }
+  buf[(*n)++] = (uint8_t) len;
+  memcpy(buf + *n, s, len);
+  *n += len;
+  return true;
+}
+
+/**
+ * @brief Queue INIT_INFO: the running partition hash plus optional details.
+ *
+ * Queued once, from bluecherry_init, and sent on the first sync that has a
+ * session to send it on. It describes the image this device booted, which does
+ * not change while the device is running, so there is nothing for a later DTLS
+ * session to re-advertise. The hash is the part the cloud acts on — it is how a
+ * reboot into new firmware is confirmed. Everything behind the presence bitmap
+ * is informational and the server never makes a decision on it.
+ *
+ * Because it is queued before there is a connection, it sits in the priority
+ * slot across however many connection attempts it takes, and a reconnect must
+ * not discard it — see the slot handling in bluecherry_sync.
+ *
+ * Fields MUST be written in ascending presence-bit order: the server decodes
+ * positionally and cannot recover from a field out of place.
+ */
+static void _bluecherry_send_init_info(void)
+{
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if(running == NULL) {
+    ESP_LOGW(TAG, "No running partition; skipping INIT_INFO");
+    return;
+  }
+
+  /* Sized from the priority slot's payload budget rather than by adding the
+   * fields up. Typical case is ~84 bytes.
+   *
+   * Only the STRING fields are bounds-checked, by _bluecherry_info_add_str.
+   * Every fixed-width field is written straight in, and ota_slot's two bytes
+   * land after two strings that may each be BLUECHERRY_INFO_STR_MAX long — so
+   * what has to hold unconditionally is that the whole unchecked path fits even
+   * at those maxima.
+   *
+   * Spelled out as a sum rather than a single number so it cannot go stale: it
+   * was hand-derived as 121 and the true figure is 120. Adding a third string
+   * BEFORE ota_slot breaks the assumption, not just the total. */
+  uint8_t payload[BLUECHERRY_EVENT_PAYLOAD_MAX];
+  _Static_assert(1 + 1 + BLUECHERRY_PARTITION_HASH_LEN + 2 /* event, schema, hash, bitmap */
+                         + 1 + 3 + 4 + 4 + 4               /* platform, version, slot size, uptime, heap */
+                         + 2                               /* ota_slot, written after the strings */
+                         + 2 * (1 + BLUECHERRY_INFO_STR_MAX) /* lib_name, mcu */
+                     <= BLUECHERRY_EVENT_PAYLOAD_MAX,
+                 "INIT_INFO's unchecked writes must fit the event payload budget even when "
+                 "every preceding string field is at its maximum length");
+  size_t n = 0;
+
+  payload[n++] = BLUECHERRY_EVENT_TYPE_INIT_INFO;
+  payload[n++] = BLUECHERRY_INIT_INFO_SCHEMA;
+
+  if(esp_partition_get_sha256(running, payload + n) != ESP_OK) {
+    ESP_LOGW(TAG, "Could not hash the running partition; skipping INIT_INFO");
+    return;
+  }
+  n += BLUECHERRY_PARTITION_HASH_LEN;
+
+  /* The bitmap has to be written before the fields it describes, so the strings
+   * are measured first and their bits only set once they are known to fit. */
+  const size_t bitmapAt = n;
+  n += 2;
+
+  uint16_t present = BLUECHERRY_INFO_BIT_PLATFORM | BLUECHERRY_INFO_BIT_LIB_VERSION |
+                     BLUECHERRY_INFO_BIT_OTA_SLOT_SIZE | BLUECHERRY_INFO_BIT_UPTIME |
+                     BLUECHERRY_INFO_BIT_TOTAL_HEAP | BLUECHERRY_INFO_BIT_OTA_SLOT;
+
+  /* Optional fields, in ascending bit order. */
+#ifdef ARDUINO
+  payload[n++] = BLUECHERRY_PLATFORM_ARDUINO;
+#else
+  payload[n++] = BLUECHERRY_PLATFORM_ESP_IDF;
+#endif
+
+  payload[n++] = BLUECHERRY_LIB_VERSION_MAJOR;
+  payload[n++] = BLUECHERRY_LIB_VERSION_MINOR;
+  payload[n++] = BLUECHERRY_LIB_VERSION_PATCH;
+
+  const esp_partition_t* slot = esp_ota_get_next_update_partition(NULL);
+  const uint32_t slotSize = slot ? slot->size : 0;
+  payload[n++] = slotSize & 0xFF;
+  payload[n++] = (slotSize >> 8) & 0xFF;
+  payload[n++] = (slotSize >> 16) & 0xFF;
+  payload[n++] = (slotSize >> 24) & 0xFF;
+
+  const uint32_t uptime = (uint32_t) (esp_timer_get_time() / 1000000);
+  payload[n++] = uptime & 0xFF;
+  payload[n++] = (uptime >> 8) & 0xFF;
+  payload[n++] = (uptime >> 16) & 0xFF;
+  payload[n++] = (uptime >> 24) & 0xFF;
+
+  /* Total, not free: free heap moves with whatever the application has
+   * allocated, so it cannot be compared between devices or over time. Total is
+   * the chip's internal-RAM capacity, which is what tells you how much room
+   * there ever was. */
+  const uint32_t heap = (uint32_t) heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  payload[n++] = heap & 0xFF;
+  payload[n++] = (heap >> 8) & 0xFF;
+  payload[n++] = (heap >> 16) & 0xFF;
+  payload[n++] = (heap >> 24) & 0xFF;
+
+  if(_bluecherry_info_add_str(payload, sizeof(payload), &n, BLUECHERRY_LIB_NAME)) {
+    present |= BLUECHERRY_INFO_BIT_LIB_NAME;
+  }
+
+#ifdef BLUECHERRY_MCU
+  if(_bluecherry_info_add_str(payload, sizeof(payload), &n, BLUECHERRY_MCU)) {
+    present |= BLUECHERRY_INFO_BIT_MCU;
+  }
+#endif
+
+  payload[n++] = _bluecherry_ota_slot_index(running);
+  payload[n++] = _bluecherry_ota_slot_index(slot);
+
+  if(_bluecherry_info_add_str(payload, sizeof(payload), &n, _bluecherry_reset_reason_str())) {
+    present |= BLUECHERRY_INFO_BIT_RESET_REASON;
+  }
+
+  payload[bitmapAt] = present & 0xFF;
+  payload[bitmapAt + 1] = (present >> 8) & 0xFF;
+
+  if(_bluecherry_publish_event(payload, (uint8_t) n) == ESP_OK) {
+    ESP_LOGD(TAG, "INIT_INFO queued (%uB)", (unsigned) n);
+  }
+}
+
+/**
+ * @brief Process an OTA initialize event: an update is on offer.
+ *
+ * Payload: [version(1)][size(4, LE)][sha256(32)][chunk size(1)] = 38 bytes
+ * after the event type byte.
+ */
+static void _processOtaInitializeEvent(uint8_t* data, uint16_t len)
+{
+  if(len != 38) {
+    ESP_LOGE(TAG, "OTA: initialize expected 38B, got %uB", len);
+    return;
+  }
+
+  if(_bluecherry_opdata.otaState != BLUECHERRY_OTA_STATE_IDLE &&
+     _bluecherry_opdata.otaState != BLUECHERRY_OTA_STATE_OFFERED) {
+    ESP_LOGW(TAG, "OTA: already busy, ignoring re-offer");
+    return;
+  }
+
+  _bluecherry_opdata.otaPartition = esp_ota_get_next_update_partition(NULL);
+  if(!_bluecherry_opdata.otaPartition) {
+    _bluecherry_opdata.otaTargetVersion = (int8_t) data[0];
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_NO_PARTITION);
+    return;
+  }
+
+  _bluecherry_opdata.otaTargetVersion = (int8_t) data[0];
+  _bluecherry_opdata.otaSize = ((uint32_t) data[1]) | ((uint32_t) data[2] << 8) |
+                               ((uint32_t) data[3] << 16) | ((uint32_t) data[4] << 24);
+  memcpy(_bluecherry_opdata.otaExpectedHash, data + 5, BLUECHERRY_PARTITION_HASH_LEN);
+
+  /* An all-zero expected hash means the cloud has no fingerprint on record, so
+   * there is nothing to check the image against. The hash is still computed and
+   * reported, since that is the value an operator needs to record one. */
+  _bluecherry_opdata.otaUnverified = true;
+  for(size_t i = 0; i < BLUECHERRY_PARTITION_HASH_LEN; ++i) {
+    if(_bluecherry_opdata.otaExpectedHash[i] != 0) {
+      _bluecherry_opdata.otaUnverified = false;
+      break;
+    }
+  }
+
+  if(_bluecherry_opdata.otaSize == 0 ||
+     _bluecherry_opdata.otaSize > _bluecherry_opdata.otaPartition->size) {
+    ESP_LOGE(TAG, "OTA: %lu bytes will not fit a %lu byte slot", _bluecherry_opdata.otaSize,
+             _bluecherry_opdata.otaPartition->size);
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_TOO_LARGE);
+    return;
+  }
+
+  _bluecherry_opdata.otaProgress = 0;
+  _bluecherry_opdata.otaBufferPos = 0;
+  _bluecherry_opdata.otaState = BLUECHERRY_OTA_STATE_OFFERED;
+
+  ESP_LOGI(TAG, "OTA: firmware v%d offered, %lu bytes, %s", _bluecherry_opdata.otaTargetVersion,
+           _bluecherry_opdata.otaSize,
+           _bluecherry_opdata.otaUnverified ? "UNVERIFIED (no fingerprint)" : "verified");
+
+  /* Nobody watching, or watching without taking the decision: start now. An
+   * application only gets to choose the moment by saying so, so forgetting to
+   * decide cannot leave a device sitting on an update forever. */
+  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_AVAILABLE, 0)) {
+    bluecherry_ota_start();
+  }
+}
+
+/**
+ * @brief Process an OTA chunk: stage it, and flush a sector at a time.
+ *
+ * The DOWNLOADING guard is what protects a finished image: once the last chunk
+ * has been staged and hashed the state moves to AWAITING_VERIFIED, so a chunk
+ * arriving after it — a duplicated frame on a lossy link — is dropped here
+ * instead of tripping the overrun check below. That path called
+ * _bluecherry_ota_fail, which overwrites the queued VERIFIED in the single
+ * priority slot with an OTA_ERROR and discards a correctly written image.
+ */
+static void _processOtaChunkEvent(uint8_t* data, uint16_t len)
+{
+  if(_bluecherry_opdata.otaState != BLUECHERRY_OTA_STATE_DOWNLOADING) {
+    ESP_LOGW(TAG, "OTA: chunk outside a download, ignoring");
+    return;
+  }
+
+  if(len == 0 || _bluecherry_opdata.otaProgress + len > _bluecherry_opdata.otaSize) {
+    ESP_LOGE(TAG, "OTA: chunk empty or beyond the announced size");
+    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_CHUNK_OVERRUN);
+    return;
   }
 
   size_t left = len;
@@ -305,13 +738,9 @@ static bool _processOtaChunkEvent(uint8_t* data, uint16_t len)
            toBuff);
     _bluecherry_opdata.otaBufferPos += toBuff;
 
-    if(!_otaBufferToFlash()) {
-      ESP_LOGE(TAG, "OTA chunk: failed to write to flash (within loop)");
-      return true;
-    } else {
-      ESP_LOGI(TAG, "OTA chunk written to flash; progress = %lu / %lu (%.2f%%)",
-               _bluecherry_opdata.otaProgress, _bluecherry_opdata.otaSize,
-               blueCherryGetOtaProgressPercent());
+    if(!_bluecherry_ota_flush()) {
+      _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_WRITE_FAILED);
+      return;
     }
 
     left -= toBuff;
@@ -320,66 +749,19 @@ static bool _processOtaChunkEvent(uint8_t* data, uint16_t len)
   memcpy(_bluecherry_opdata.otaBuffer + _bluecherry_opdata.otaBufferPos, data + (len - left), left);
   _bluecherry_opdata.otaBufferPos += left;
 
+  /* The last sector is short of the flush threshold above, so the final flush
+   * is triggered by the byte count instead — and it is the one that reports
+   * 100%. No progress event is emitted for a chunk that only staged bytes:
+   * nothing observable changed. */
   if(_bluecherry_opdata.otaProgress + _bluecherry_opdata.otaBufferPos ==
      _bluecherry_opdata.otaSize) {
-    if(!_otaBufferToFlash()) {
-      ESP_LOGE(TAG, "OTA chunk: failed to write to flash (remainder)");
-      return true;
-    } else {
-      ESP_LOGD(TAG, "OTA remainder written to flash; progress = %lu / %lu (%.2f%%)",
-               _bluecherry_opdata.otaProgress, _bluecherry_opdata.otaSize,
-               blueCherryGetOtaProgressPercent());
+    if(!_bluecherry_ota_flush()) {
+      _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_WRITE_FAILED);
+      return;
     }
+    ESP_LOGI(TAG, "OTA: %lu bytes received, verifying", _bluecherry_opdata.otaProgress);
+    _bluecherry_ota_verify();
   }
-
-  return false;
-}
-
-/**
- * @brief Process an OTA finish event.
- *
- * This function verifies the exact announced size has been flashed, could verify the
- * optional included SHA256.
- *
- * @return Whether we should emit an error BC event on next sync, in case the size
- * mismatches the announced size, or the optional included SHA256 digest mismatches the
- * corresponding image.
- */
-static bool _processOtaFinishEvent(void)
-{
-  if(!_bluecherry_opdata.otaSize || _bluecherry_opdata.otaProgress != _bluecherry_opdata.otaSize) {
-    return true;
-  }
-
-  /* enable partition: write the stashed first bytes */
-  if(esp_partition_write(_bluecherry_opdata.otaPartition, 0,
-                         (uint32_t*) _bluecherry_opdata.otaSkipBuffer,
-                         ENCRYPTED_BLOCK_SIZE) != ESP_OK) {
-    ESP_LOGE(TAG, "OTA Finish: Could not write start of boot sector to partition");
-    return true;
-  }
-
-  /* check if partition is bootable */
-  if(esp_partition_read(_bluecherry_opdata.otaPartition, 0,
-                        (uint32_t*) _bluecherry_opdata.otaSkipBuffer,
-                        ENCRYPTED_BLOCK_SIZE) != ESP_OK) {
-    ESP_LOGE(TAG, "OTA Finish: Could not read boot partition");
-    return true;
-  }
-  if(_bluecherry_opdata.otaSkipBuffer[0] != ESP_IMAGE_HEADER_MAGIC) {
-    ESP_LOGE(TAG, "OTA Finish: Magic header is missing on partition");
-    return true;
-  }
-
-  if(esp_ota_set_boot_partition(_bluecherry_opdata.otaPartition)) {
-    ESP_LOGE(TAG, "OTA Finish: Could not set boot partition");
-    return true;
-  }
-
-  ESP_LOGI(TAG, "OTA Finish: set boot partition. Booting in new firmware.");
-  esp_restart();
-
-  return false;
 }
 
 /**
@@ -388,29 +770,56 @@ static bool _processOtaFinishEvent(void)
  * This function is called when blueCherryDidRing encounters a BlueCherry management packet,
  * eg for OTA updates.
  *
+ * Events 1, 2 and 3 are OTA messages this client does not implement — see
+ * BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL for why the cloud sends them at
+ * all. Event 1 is answered with the [4][0xB2] probe reply and nothing else; 2
+ * and 3 are discarded outright. Discarding them is not laziness — a handful can
+ * still be in flight in the window before the cloud's switch takes effect, and
+ * writing them would corrupt the partition.
+ *
  * @param data The event data.
  * @param len The length of the data block.
- *
- * @return Whether we should emit an error BC event on next sync.
  */
-static bool _blueCherryProcessEvent(uint8_t* data, uint8_t len)
+static void _blueCherryProcessEvent(uint8_t* data, uint8_t len)
 {
-  switch(data[0]) {
-  case BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE:
-    return _processOtaInitializeEvent(data + 1, len - 1);
-
-  case BLUECHERRY_EVENT_TYPE_OTA_CHUNK:
-    return _processOtaChunkEvent(data + 1, len - 1);
-
-  case BLUECHERRY_EVENT_TYPE_OTA_FINISH:
-    return _processOtaFinishEvent();
-
-  default:
-    ESP_LOGE(TAG, "Error: invalid BlueCherry event type 0x%x from cloud server", data[0]);
-    return true;
+  if(len == 0) {
+    ESP_LOGW(TAG, "Empty BlueCherry event, ignoring");
+    return;
   }
 
-  return true;
+  switch(data[0]) {
+  case BLUECHERRY_EVENT_TYPE_OTA_PROBE: {
+    /* Answer it and touch no OTA state: the cloud has not yet been told what we
+     * speak, and treating this as an offer would clobber a transfer that may
+     * already be running. */
+    ESP_LOGI(TAG, "OTA probe from the cloud, answered");
+    uint8_t reply[2] = { BLUECHERRY_EVENT_TYPE_ERROR,
+                         BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL };
+    _bluecherry_publish_event(reply, sizeof(reply));
+    break;
+  }
+
+  case BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_CHUNK:
+  case BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_FINISH:
+    /* Leftovers from the probe window. Discard them. */
+    ESP_LOGD(TAG, "Ignoring unsupported OTA event 0x%x", data[0]);
+    break;
+
+  case BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE:
+    _processOtaInitializeEvent(data + 1, len - 1);
+    break;
+
+  case BLUECHERRY_EVENT_TYPE_OTA_CHUNK:
+    _processOtaChunkEvent(data + 1, len - 1);
+    break;
+
+  default:
+    /* Benign on purpose. An unknown event must never abort a running update:
+     * this arm once reported failure to the caller, which zeroed otaSize and
+     * killed a transfer because the cloud mentioned something newer than us. */
+    ESP_LOGW(TAG, "Ignoring unknown BlueCherry event type 0x%x from cloud server", data[0]);
+    break;
+  }
 }
 
 #pragma endregion
@@ -570,8 +979,6 @@ static bool _ztp_finish_csr_gen(bool result)
  * @brief Cleanup the Mbed TLS resources.
  *
  * This function cleans up the Mbed TLS resources used by the BlueCherry connection.
- *
- * @return None.
  */
 static void _bluecherry_cleanup_mbedtls()
 {
@@ -588,8 +995,6 @@ static void _bluecherry_cleanup_mbedtls()
  * @brief Cleanup the network resources.
  *
  * This function cleans up the network resources used by the BlueCherry connection.
- *
- * @return None.
  */
 static void _bluecherry_cleanup_network()
 {
@@ -605,8 +1010,6 @@ static void _bluecherry_cleanup_network()
  *
  * This function closes the current socket and frees the SSL session state,
  * without touching RNG, entropy, certificates, or SSL config.
- *
- * @return None.
  */
 static void _bluecherry_cleanup_session()
 {
@@ -771,7 +1174,7 @@ static bool _bluecherry_dtls_connect(const char* host, const char* port)
     while((ret = mbedtls_ssl_handshake(&_bluecherry_opdata.ssl)) != 0) {
       if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
          ret == MBEDTLS_ERR_SSL_TIMEOUT) {
-        if(difftime(time(NULL), start) >= 30) {
+        if(difftime(time(NULL), start) >= SSL_HANDSHAKE_TIMEOUT_SEC) {
           ESP_LOGE(TAG, "DTLS handshake timeout");
           goto cleanup;
         }
@@ -868,7 +1271,14 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
 
   uint8_t missed_msg_count = (uint8_t) (tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
 
-  data[0] = 0x40;
+  /* Two deliberate departures from CoAP, both of which the server depends on:
+   *
+   *   - byte 1 is the CoAP Code, repurposed as this device's lost-message
+   *     counter. The server reads it as nr_lost to decide whether to replay the
+   *     previous frame or pop new messages, and closes the session at 250.
+   *   - byte 4 is the 0xFF payload marker, written even when there is no
+   *     payload. Real CoAP omits it; this framing always expects it. */
+  data[0] = 0x40; /* CON, TKL=0 */
   data[1] = missed_msg_count;
   data[2] = tx_message_id >> 8;
   data[3] = tx_message_id & 0xFF;
@@ -1231,10 +1641,10 @@ static int _ztp_cbor_encode_uint64(_ztp_cbor_t* cbor, uint64_t value)
 /**
  * @brief Encodes a signed integer into CBOR format.
  *
- * @param cbor @brief CBOR context.
- * @param value @brief Value to encode.
+ * @param cbor The CBOR context.
+ * @param value Value to encode.
  *
- * @return @brief 0 on success, non-zero on failure.
+ * @return 0 on success, non-zero on failure.
  */
 static int _ztp_cbor_encode_int(_ztp_cbor_t* cbor, int value)
 {
@@ -1250,10 +1660,10 @@ static int _ztp_cbor_encode_int(_ztp_cbor_t* cbor, int value)
 /**
  * @brief Starts encoding an array into CBOR format.
  *
- * @param cbor @brief CBOR context.
- * @param size @brief Expected size of the array.
+ * @param cbor The CBOR context.
+ * @param size Expected size of the array.
  *
- * @return @brief 0 on success, non-zero on failure.
+ * @return 0 on success, non-zero on failure.
  */
 static int _ztp_cbor_start_array(_ztp_cbor_t* cbor, size_t size)
 {
@@ -1263,10 +1673,10 @@ static int _ztp_cbor_start_array(_ztp_cbor_t* cbor, size_t size)
 /**
  * @brief Starts encoding a map into CBOR format.
  *
- * @param cbor @brief CBOR context.
- * @param size @brief Expected size of the map.
+ * @param cbor The CBOR context.
+ * @param size Expected size of the map.
  *
- * @return @brief 0 on success, non-zero on failure.
+ * @return 0 on success, non-zero on failure.
  */
 static int _ztp_cbor_start_map(_ztp_cbor_t* cbor, size_t size)
 {
@@ -1276,12 +1686,12 @@ static int _ztp_cbor_start_map(_ztp_cbor_t* cbor, size_t size)
 /**
  * @brief Decodes a device ID from CBOR data.
  *
- * @param cbor_data @brief CBOR data to decode.
- * @param cbor_size @brief Size of CBOR data.
- * @param decoded_str @brief Buffer to store decoded device ID.
- * @param decoded_size @brief Size of decoded device ID buffer.
+ * @param cbor_data CBOR data to decode.
+ * @param cbor_size Size of CBOR data.
+ * @param decoded_str Buffer to store decoded device ID.
+ * @param decoded_size Size of decoded device ID buffer.
  *
- * @return @brief 0 on success, non-zero on failure.
+ * @return 0 on success, non-zero on failure.
  */
 static int _ztp_cbor_decode_device_id(const uint8_t* cbor_data, size_t cbor_size, char* decoded_str,
                                       size_t decoded_size)
@@ -1328,12 +1738,12 @@ static int _ztp_cbor_decode_device_id(const uint8_t* cbor_data, size_t cbor_size
 /**
  * @brief Decodes a signed certificate from CBOR data.
  *
- * @param cbor_data @brief CBOR data to decode.
- * @param cbor_size @brief Size of CBOR data.
- * @param decoded_data @brief Buffer to store decoded certificate.
- * @param decoded_len @brief Pointer to store size of decoded certificate.
+ * @param cbor_data CBOR data to decode.
+ * @param cbor_size Size of CBOR data.
+ * @param decoded_data Buffer to store decoded certificate.
+ * @param decoded_len Pointer to store size of decoded certificate.
  *
- * @return @brief 0 on success, non-zero on failure.
+ * @return 0 on success, non-zero on failure.
  */
 static int _ztp_cbor_decode_certificate(const uint8_t* cbor_data, size_t cbor_size,
                                         unsigned char* decoded_data, size_t* decoded_len)
@@ -1688,6 +2098,12 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     _watchdog = true;
   }
 
+  /* Queued once, here, rather than on every connect: it describes the image
+   * this device booted, which cannot change while it is running. It waits in
+   * the priority slot until there is a session to carry it. Queued before the
+   * sync task starts so the slot is already filled when that task first runs. */
+  _bluecherry_send_init_info();
+
   if(auto_sync) {
     BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync", 4096, NULL, BLUECHERRY_SP, NULL);
     if(ret != pdPASS) {
@@ -1805,6 +2221,27 @@ esp_err_t bluecherry_sync(bool blocking)
       _bluecherry_opdata.cur_message_id = 0;
       _bluecherry_opdata.last_acked_message_id = 0;
 
+      /* Abandon any transfer in progress. The server restarts an OTA from
+       * chunk 0 on a new session, so keeping otaProgress would resume writing
+       * at a stale offset and quietly corrupt the image — and unfixable any
+       * other way, because sequential chunks carry no offset to re-sync
+       * against. A protocol reply from the dead session is equally
+       * meaningless, so the priority slot goes with it.
+       *
+       * INIT_INFO is the one exception. It is queued once at init and
+       * describes the image this device booted rather than anything about the
+       * session, so it is kept until it has actually been sent — otherwise a
+       * device that takes several attempts to connect would drop it. */
+      _bluecherry_ota_reset();
+      if(_bluecherry_opdata.pending_event_len > 0) {
+        const uint8_t pending_event_type =
+            _bluecherry_opdata
+                .pending_event[BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE];
+        if(pending_event_type != BLUECHERRY_EVENT_TYPE_INIT_INFO) {
+          _bluecherry_opdata.pending_event_len = 0;
+        }
+      }
+
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;
     } else {
@@ -1823,11 +2260,32 @@ esp_err_t bluecherry_sync(bool blocking)
   int blocktime = blocking ? wait_ticks : 0;
   _bluecherry_msg_t out_msg;
 
-  // Wait up to 200ms for an outgoing message to be available
-  if(xQueuePeek(_bluecherry_opdata.out_queue, &out_msg, blocktime) == pdPASS) {
-    // Transmit the message
+  // Internal-channel protocol replies jump the application queue. Only one
+  // message goes out per sync, so a probe reply left to queue behind up to
+  // CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES publishes would be that
+  // many syncs away — long enough for the server to push a whole image in a
+  // form this client cannot accept.
+  if(_bluecherry_opdata.pending_event_len > 0) {
+    _bluecherry_msg_t ev = { .len = _bluecherry_opdata.pending_event_len,
+                             .data = _bluecherry_opdata.pending_event };
+    if(_bluecherry_coap_rxtx(&ev) != ESP_OK) {
+      ESP_LOGE(TAG, "Could not sync internal event with cloud");
+      _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+      return ESP_ERR_NOT_FINISHED;
+    }
+    _bluecherry_opdata.pending_event_len = 0;
+
+    // rxtx only returns ESP_OK once the ACK is in, so this is where a VERIFIED
+    // is known to have landed — and therefore the only safe point to make the
+    // new image the boot target.
+    if(_bluecherry_opdata.otaState == BLUECHERRY_OTA_STATE_AWAITING_VERIFIED) {
+      _bluecherry_ota_commit();
+    }
+  }
+  // Peeked, not received: the message stays queued until its ACK is in, so a
+  // failed sync retries it rather than dropping it.
+  else if(xQueuePeek(_bluecherry_opdata.out_queue, &out_msg, blocktime) == pdPASS) {
     if(_bluecherry_coap_rxtx(&out_msg) == ESP_OK) {
-      // Remove the transmitted message from the queue
       if(xQueueReceive(_bluecherry_opdata.out_queue, &out_msg, 0) == pdPASS) {
         free(out_msg.data);
       } else {
@@ -1840,16 +2298,16 @@ esp_err_t bluecherry_sync(bool blocking)
       return ESP_ERR_NOT_FINISHED;
     }
   } else {
-    // Nothing to send, perform periodic sync if needed
+    // Nothing to send. An empty sync still has to go out periodically: it is
+    // the only thing that lets the server deliver downlink to a device that
+    // never publishes.
     if(!blocking || ((now - _bluecherry_opdata.last_tx_time) >= CONFIG_BLUECHERRY_AUTO_SYNC_SEC)) {
-      // Perform an empty sync
       if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
         ESP_LOGE(TAG, "Could not sync with cloud");
         _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
         return ESP_ERR_NOT_FINISHED;
       }
     } else {
-      // No messages to send and no periodic sync needed
       return ESP_OK;
     }
   }
@@ -1926,10 +2384,7 @@ esp_err_t bluecherry_sync(bool blocking)
     if(topic == 0x00) {
       want_resync = true;
 
-      if(_blueCherryProcessEvent(_bluecherry_opdata.in_buf + offset, data_len)) {
-        _bluecherry_opdata.emitErrorEvent = true;
-        _bluecherry_opdata.otaSize = 0;
-      }
+      _blueCherryProcessEvent(_bluecherry_opdata.in_buf + offset, data_len);
     } else if(_bluecherry_opdata.msg_handler != NULL) {
       _bluecherry_opdata.msg_handler(topic, data_len, _bluecherry_opdata.in_buf + offset,
                                      _bluecherry_opdata.msg_handler_args);
@@ -1977,6 +2432,46 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
     return ESP_ERR_NO_MEM;
   }
 
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* args)
+{
+  _bluecherry_opdata.ota_handler = handler;
+  _bluecherry_opdata.ota_handler_args = args;
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_ota_start(void)
+{
+  if(_bluecherry_opdata.otaState != BLUECHERRY_OTA_STATE_OFFERED) {
+    ESP_LOGW(TAG, "bluecherry_ota_start: no update is on offer");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  uint8_t payload[2] = { BLUECHERRY_EVENT_TYPE_OTA_START,
+                         (uint8_t) _bluecherry_opdata.otaTargetVersion };
+  esp_err_t err = _bluecherry_publish_event(payload, sizeof(payload));
+  if(err != ESP_OK) {
+    return err;
+  }
+
+  _bluecherry_opdata.otaState = BLUECHERRY_OTA_STATE_DOWNLOADING;
+  _bluecherry_opdata.otaProgress = 0;
+  _bluecherry_opdata.otaBufferPos = 0;
+
+  ESP_LOGI(TAG, "OTA: requesting firmware v%d (%lu bytes)", _bluecherry_opdata.otaTargetVersion,
+           _bluecherry_opdata.otaSize);
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_STARTED, 0);
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_ota_abort(uint8_t error_code)
+{
+  if(_bluecherry_opdata.otaState == BLUECHERRY_OTA_STATE_IDLE) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  _bluecherry_ota_fail(error_code);
   return ESP_OK;
 }
 
