@@ -40,7 +40,7 @@ static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
 /**
  * @brief The port of the BlueCherry cloud.
  */
-static const char* BLUECHERRY_PORT = "5686";
+static const char* BLUECHERRY_PORT = "5684";
 
 /**
  * @brief The port of the BlueCherry ZTP server.
@@ -139,6 +139,10 @@ static void _bluecherry_sync_task(void* args)
     } else {
       block = true;
     }
+    /* Also fed on the way out, so a long sync is bracketed rather than merely
+     * preceded by a reset. Feeding only before the call leaves the effective
+     * budget at "the watchdog timeout minus one whole sync". */
+    _tickleWatchdog();
   }
 }
 
@@ -350,8 +354,8 @@ static void _bluecherry_ota_fail(uint8_t error_code)
  *
  * The hash is read back from flash rather than accumulated over the arriving
  * bytes, so it attests to what is actually stored, and it is exactly the
- * SHA-256 ESP-IDF appends to the image — the same value the cloud holds in
- * ota_updates.firmware_fingerprint.
+ * SHA-256 ESP-IDF appends to the image — the same value the cloud records as the
+ * fingerprint of that build.
  */
 static void _bluecherry_ota_verify(void)
 {
@@ -393,8 +397,8 @@ static void _bluecherry_ota_verify(void)
   }
 
   /* 3. Report it. In unverified mode there was nothing to compare against, but
-   * the hash is still sent: it is the value an operator needs to populate
-   * ota_updates.firmware_fingerprint and turn this into a verified update. */
+   * the hash is still sent: it is the value an operator needs to record as the
+   * build's fingerprint and turn this into a verified update. */
   uint8_t payload[2 + BLUECHERRY_PARTITION_HASH_LEN];
   payload[0] = BLUECHERRY_EVENT_TYPE_OTA_VERIFIED;
   payload[1] = (uint8_t) _bluecherry_opdata.otaTargetVersion;
@@ -442,8 +446,8 @@ static void _bluecherry_ota_commit(void)
  *
  * ESP subtypes OTA_0..OTA_15 become 0..15; a factory or test partition, or no
  * partition at all, becomes BLUECHERRY_OTA_SLOT_NONE. The wire carries the
- * index rather than the subtype so a zephyr or linux library does not have to
- * invent ESP encodings.
+ * index rather than the subtype, so reporting it does not require the reader to
+ * understand an ESP-specific encoding.
  */
 static uint8_t _bluecherry_ota_slot_index(const esp_partition_t* part)
 {
@@ -457,9 +461,9 @@ static uint8_t _bluecherry_ota_slot_index(const esp_partition_t* part)
 /**
  * @brief Why the device last booted, as a string.
  *
- * A string rather than the raw esp_reset_reason_t so every library is
- * self-describing and the cloud needs no per-platform lookup table — the enum
- * values differ between ESP-IDF, Zephyr and nRF Connect.
+ * A string rather than the raw esp_reset_reason_t, so the report is
+ * self-describing and the cloud needs no lookup table for it — the numeric
+ * values behind these names are not portable.
  *
  * Only the reasons that exist across the IDF versions this library claims to
  * support are named; ESP_RST_USB, _JTAG and friends arrived in 5.0 and would
@@ -1060,18 +1064,18 @@ static bool _bluecherry_setup_mbedtls(const uint8_t* mac)
 }
 
 /**
- * @brief Configure the Mbed TLS credentials.
+ * @brief Configure the CA chain used to authenticate the BlueCherry server.
  *
- * This function configures the Mbed TLS credentials used by the BlueCherry connection.
+ * Called exactly once per init. It is kept separate from the device credentials because
+ * provisioning needs the CA before it has a device certificate to present, and
+ * mbedtls_x509_crt_parse appends to the chain it is given — so parsing the CA a second time
+ * would leave two copies of it in the context.
  *
  * @param caCert Pointer to the CA certificate in PEM format.
- * @param devCert Pointer to the device certificate in PEM format, or NULL if not used.
- * @param devKey Pointer to the device private key in PEM format, or NULL if not used.
  *
  * @return true if the configuration was successful, false otherwise.
  */
-static bool _bluecherry_configure_credentials(const char* caCert, const char* devCert,
-                                              const char* devKey)
+static bool _bluecherry_configure_ca(const char* caCert)
 {
   int ret = mbedtls_x509_crt_parse(&_bluecherry_opdata.cacert, (const uint8_t*) caCert,
                                    strlen(caCert) + 1);
@@ -1080,31 +1084,59 @@ static bool _bluecherry_configure_credentials(const char* caCert, const char* de
     return false;
   }
 
-  if(devCert && devKey) {
-    ret = mbedtls_x509_crt_parse(&_bluecherry_opdata.devcert, (const uint8_t*) devCert,
-                                 strlen(devCert) + 1);
-    if(ret != 0) {
-      ESP_LOGE(TAG, "Could not parse device certificate: -%04X", -ret);
-      return false;
-    }
+  mbedtls_ssl_conf_ca_chain(&_bluecherry_opdata.ssl_conf, &_bluecherry_opdata.cacert, NULL);
+  return true;
+}
 
-    ret = mbedtls_pk_parse_key(&_bluecherry_opdata.devkey, (const uint8_t*) devKey,
-                               strlen(devKey) + 1, NULL, 0, mbedtls_entropy_func,
-                               &_bluecherry_opdata.ctr_drbg);
-    if(ret != 0) {
-      ESP_LOGE(TAG, "Could not parse device key: -%04X", -ret);
-      return false;
-    }
+/**
+ * @brief Configure the device certificate and key this device presents to the server.
+ *
+ * Called either at init for an already provisioned device, or from bluecherry_sync once
+ * provisioning has issued a certificate.
+ *
+ * @param devCert Pointer to the device certificate in PEM format.
+ * @param devKey Pointer to the device private key in PEM format.
+ *
+ * @return true if the configuration was successful, false otherwise.
+ */
+static bool _bluecherry_configure_own_cert(const char* devCert, const char* devKey)
+{
+  int ret;
 
-    ret = mbedtls_ssl_conf_own_cert(&_bluecherry_opdata.ssl_conf, &_bluecherry_opdata.devcert,
-                                    &_bluecherry_opdata.devkey);
-    if(ret != 0) {
-      ESP_LOGE(TAG, "Could not configure device cert/key in context: -%04X", -ret);
-      return false;
-    }
+  if(devCert == NULL || devKey == NULL) {
+    return false;
   }
 
-  mbedtls_ssl_conf_ca_chain(&_bluecherry_opdata.ssl_conf, &_bluecherry_opdata.cacert, NULL);
+  /* Start from empty contexts. mbedtls_x509_crt_parse appends, so a retry after a partial
+   * failure here would otherwise leave two copies of the certificate in the chain. Freeing a
+   * context that was only initialised is well defined, so this is safe on the first call. */
+  mbedtls_x509_crt_free(&_bluecherry_opdata.devcert);
+  mbedtls_pk_free(&_bluecherry_opdata.devkey);
+  mbedtls_x509_crt_init(&_bluecherry_opdata.devcert);
+  mbedtls_pk_init(&_bluecherry_opdata.devkey);
+
+  ret = mbedtls_x509_crt_parse(&_bluecherry_opdata.devcert, (const uint8_t*) devCert,
+                               strlen(devCert) + 1);
+  if(ret != 0) {
+    ESP_LOGE(TAG, "Could not parse device certificate: -%04X", -ret);
+    return false;
+  }
+
+  ret =
+      mbedtls_pk_parse_key(&_bluecherry_opdata.devkey, (const uint8_t*) devKey, strlen(devKey) + 1,
+                           NULL, 0, mbedtls_entropy_func, &_bluecherry_opdata.ctr_drbg);
+  if(ret != 0) {
+    ESP_LOGE(TAG, "Could not parse device key: -%04X", -ret);
+    return false;
+  }
+
+  ret = mbedtls_ssl_conf_own_cert(&_bluecherry_opdata.ssl_conf, &_bluecherry_opdata.devcert,
+                                  &_bluecherry_opdata.devkey);
+  if(ret != 0) {
+    ESP_LOGE(TAG, "Could not configure device cert/key in context: -%04X", -ret);
+    return false;
+  }
+
   return true;
 }
 
@@ -1130,7 +1162,12 @@ static bool _bluecherry_dtls_connect(const char* host, const char* port)
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
 
+  /* getaddrinfo blocks for as long as the resolver takes and cannot be given a
+   * timeout, so the watchdog is fed on both sides of it. With no route out,
+   * lwIP walks every configured server before returning. */
+  _tickleWatchdog();
   ret = getaddrinfo(host, port, &hints, &res);
+  _tickleWatchdog();
   if(ret != 0 || res == NULL) {
     ESP_LOGE(TAG, "DNS lookup failed: %d", ret);
     goto cleanup;
@@ -1169,15 +1206,25 @@ static bool _bluecherry_dtls_connect(const char* host, const char* port)
   mbedtls_ssl_set_bio(&_bluecherry_opdata.ssl, &_bluecherry_opdata.sock, _bluecherry_dtls_send,
                       _bluecherry_dtls_recv, NULL);
 
+  /* An unanswered ClientHello parks this loop for the full handshake budget, so
+   * it must feed the watchdog like every other polling loop here. It is also
+   * the only one reachable before the sync task exists: the provisioning path
+   * calls this from the application's own task.
+   *
+   * The deadline is monotonic on purpose. time(NULL) moves when SNTP steps the
+   * clock, which typically happens seconds after the network comes up — exactly
+   * when the first handshake runs — and a stepped clock makes a wall-clock
+   * deadline either expire at once or never expire at all. */
   {
-    time_t start = time(NULL);
+    int64_t start_us = esp_timer_get_time();
     while((ret = mbedtls_ssl_handshake(&_bluecherry_opdata.ssl)) != 0) {
       if(ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
          ret == MBEDTLS_ERR_SSL_TIMEOUT) {
-        if(difftime(time(NULL), start) >= SSL_HANDSHAKE_TIMEOUT_SEC) {
+        if((esp_timer_get_time() - start_us) >= (int64_t) SSL_HANDSHAKE_TIMEOUT_SEC * 1000000) {
           ESP_LOGE(TAG, "DTLS handshake timeout");
           goto cleanup;
         }
+        _tickleWatchdog();
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -1295,7 +1342,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
       return ESP_FAIL;
     }
 
-    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE;
+    _bluecherry_opdata.state = BLUECHERRY_STATE_AWAITING_RESPONSE;
 
     while(true) {
       int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
@@ -1328,7 +1375,12 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
         }
 
         _bluecherry_opdata.cur_message_id = tx_message_id;
-        _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
+        /* Settle the state before returning. AWAITING_RESPONSE is rejected on entry to
+         * bluecherry_sync, and one caller path returns without assigning a state of its own,
+         * so leaving it set here would reject every later sync for the lifetime of the
+         * process. The caller overwrites this with IDLE or PENDING_MESSAGES once it has
+         * walked the response. */
+        _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
         return ESP_OK;
       } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
         return ESP_FAIL;
@@ -1342,7 +1394,8 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
     timeout *= 2;
   }
 
-  _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
+  /* Settle the state here too; the caller moves it to AWAIT_CONNECTION. */
+  _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
   return ESP_ERR_TIMEOUT;
 }
 
@@ -1354,9 +1407,16 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
  * the provided header and payload, sends it over the DTLS connection, and waits for
  * a response.
  *
+ * The response is not parsed: a fixed header length is skipped and the remainder is handed
+ * back verbatim. rx_cap is therefore the only thing standing between a malformed or hostile
+ * response and the caller's buffer, so an oversized response is rejected rather than
+ * truncated — a short CBOR frame would fail to decode anyway, so the error is the honest
+ * outcome.
+ *
  * @param tx_buf Pointer to the buffer containing the payload to transmit.
  * @param tx_len Length of the payload to transmit.
  * @param rx_buf Pointer to the buffer where the received data will be stored.
+ * @param rx_cap Capacity of rx_buf in bytes.
  * @param rx_len Pointer to a variable where the length of the received data will be stored.
  * @param header Pointer to the CoAP header to be used for the message.
  * @param header_len Length of the CoAP header.
@@ -1364,7 +1424,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
  * @return true if the transmission and reception were successful, false otherwise.
  */
 static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                             uint16_t* rx_len, const uint8_t* header,
+                                             size_t rx_cap, uint16_t* rx_len, const uint8_t* header,
                                              size_t header_len)
 {
   static time_t last_tx_time = 0;
@@ -1375,7 +1435,13 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
   }
 
   size_t data_len = header_len;
-  uint8_t data[header_len + 1 + tx_len];
+  uint8_t data[BLUECHERRY_ZTP_TX_BUF_SIZE];
+
+  if(header_len + 1 + (size_t) tx_len > sizeof(data)) {
+    ESP_LOGE(TAG, "ZTP request of %u bytes does not fit the transmit buffer",
+             (unsigned) (header_len + 1 + (size_t) tx_len));
+    return false;
+  }
 
   memcpy(data, header, header_len);
 
@@ -1399,9 +1465,15 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
       int ret = _bluecherry_mbed_dtls_read(temp_buf, sizeof(temp_buf));
 
       if(ret > 0) {
-        if(ret > 7) {
-          memcpy(rx_buf, temp_buf + 7, ret - 7);
-          *rx_len = (uint16_t) (ret - 7);
+        if(ret > BLUECHERRY_ZTP_RSP_HEADER_LEN) {
+          size_t payload_len = (size_t) ret - BLUECHERRY_ZTP_RSP_HEADER_LEN;
+          if(payload_len > rx_cap) {
+            ESP_LOGE(TAG, "ZTP response payload of %u bytes exceeds the %u byte buffer",
+                     (unsigned) payload_len, (unsigned) rx_cap);
+            return false;
+          }
+          memcpy(rx_buf, temp_buf + BLUECHERRY_ZTP_RSP_HEADER_LEN, payload_len);
+          *rx_len = (uint16_t) payload_len;
         } else {
           *rx_len = 0;
         }
@@ -1435,7 +1507,7 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
  * @return true if the transmission and reception were successful, false otherwise.
  */
 static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                            uint16_t* rx_len)
+                                            size_t rx_cap, uint16_t* rx_len)
 {
   const uint8_t header[] = { 0x40,
                              0x01,
@@ -1451,7 +1523,8 @@ static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, ui
                              0x69,
                              0x64 };
 
-  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_len, header, sizeof(header));
+  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_cap, rx_len, header,
+                                          sizeof(header));
 }
 
 /**
@@ -1469,7 +1542,7 @@ static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, ui
  * @return true if the transmission and reception were successful, false otherwise.
  */
 static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                           uint16_t* rx_len)
+                                           size_t rx_cap, uint16_t* rx_len)
 {
   const uint8_t header[] = { 0x40,
                              0x01,
@@ -1484,7 +1557,8 @@ static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uin
                              0x67,
                              0x6E };
 
-  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_len, header, sizeof(header));
+  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_cap, rx_len, header,
+                                          sizeof(header));
 }
 
 #pragma endregion
@@ -1905,7 +1979,8 @@ static bool _ztp_request_device_id()
 
   uint8_t in_buf[16];
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_devid(cborBuf, _ztp_cbor_size(&cbor), in_buf, &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx_devid(cborBuf, _ztp_cbor_size(&cbor), in_buf, sizeof(in_buf),
+                                      &in_len)) {
     ESP_LOGE("ZTP", "Failed to sync with ZTP COAP server");
     return false;
   }
@@ -2006,7 +2081,8 @@ static bool _ztp_request_signed_certificate()
   }
 
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_sign(cborBuf, _ztp_cbor_size(&cbor), coapData, &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx_sign(cborBuf, _ztp_cbor_size(&cbor), coapData, sizeof(coapData),
+                                     &in_len)) {
     ESP_LOGE("ZTP", "Failed to receive response from ZTP COAP server");
     return false;
   }
@@ -2048,13 +2124,111 @@ static bool _ztp_request_signed_certificate()
 #pragma endregion
 #pragma region PUBLIC
 
-esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
-                          bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                          bool auto_sync, uint16_t watchdog_timeout_seconds)
+/**
+ * @brief Load or obtain the device credentials, then install them.
+ *
+ * Reads the stored certificate and key through the application's storage handler and, when
+ * they are absent, runs a full provisioning cycle against the provisioning service before
+ * writing the issued pair back through the same handler.
+ *
+ * Runs from bluecherry_sync rather than from init, so that reserving memory and reaching the
+ * network stay separate concerns and a device with no cloud in sight still initialises.
+ *
+ * @return true once credentials are installed and the connection can be attempted.
+ */
+static bool _bluecherry_provision(void)
 {
-  if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED)
-    return ESP_OK;
+  const char* device_cert =
+      _bluecherry_opdata.ztp_bio_handler(true, false, _bluecherry_opdata.ztp_bio_handler_args);
+  const char* device_key =
+      _bluecherry_opdata.ztp_bio_handler(true, true, _bluecherry_opdata.ztp_bio_handler_args);
 
+  if(device_cert == NULL || device_key == NULL) {
+    uint8_t mac[8] = { 0 };
+
+    ESP_LOGW(TAG, "Device is not provisioned for BlueCherry communication, starting ZTP...");
+
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
+    /* The provisioning service is authenticated against the same CA, but this device has no
+     * certificate of its own to present yet, so the session is one-sided. */
+    if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_ZTP_PORT)) {
+      ESP_LOGE(TAG, "(ZTP) Could not connect to the provisioning server");
+      goto fail;
+    }
+
+    ESP_LOGI(TAG, "Connected to ZTP server");
+
+    if(!_ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
+      ESP_LOGE(TAG, "(ZTP) Could not add MAC address as ZTP device ID parameter");
+      goto fail;
+    }
+
+    if(!_ztp_request_device_id()) {
+      ESP_LOGE(TAG, "(ZTP) Could not request device ID");
+      goto fail;
+    }
+
+    if(!_ztp_generate_key_and_csr()) {
+      ESP_LOGE(TAG, "(ZTP) Could not generate private key");
+      goto fail;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    if(!_ztp_request_signed_certificate()) {
+      ESP_LOGE(TAG, "(ZTP) Could not request signed certificate");
+      goto fail;
+    }
+
+    /* Persist before installing: a reset between the two re-reads them on the next boot,
+     * whereas the other order would discard a certificate that has already been issued. */
+    _bluecherry_opdata.ztp_bio_handler(false, false, (void*) ztp_certBuf);
+    _bluecherry_opdata.ztp_bio_handler(false, true, (void*) ztp_pkeyBuf);
+
+    device_cert = ztp_certBuf;
+    device_key = ztp_pkeyBuf;
+
+    /* The provisioning session authenticated only the server. Drop it so the traffic session
+     * is built from scratch with the credentials just installed. */
+    _bluecherry_cleanup_session();
+  }
+
+  if(!_bluecherry_configure_own_cert(device_cert, device_key)) {
+    ESP_LOGE(TAG, "Could not configure device credentials");
+    goto fail;
+  }
+
+  _bluecherry_opdata.ztp_devIdParams.count = 0;
+  return true;
+
+fail:
+  _bluecherry_cleanup_session();
+  _bluecherry_opdata.ztp_devIdParams.count = 0;
+  return false;
+}
+
+/**
+ * @brief Reserve everything both entry points need, without touching the network.
+ *
+ * Allocates the outgoing queue, sets up the Mbed TLS contexts and the CA chain, configures the
+ * watchdog and starts the synchronisation task. The caller supplies the state to settle in,
+ * which is the only thing that differs between a pre-provisioned device and one that still has
+ * to be provisioned.
+ *
+ * @param msg_handler The message handler or NULL to ignore incoming messages.
+ * @param msg_handler_args Optional user arguments to pass to the message handler.
+ * @param auto_sync True to spawn the automatic synchronisation task.
+ * @param watchdog_timeout_seconds The task watchdog timeout in seconds, or 0 to leave it alone.
+ * @param initial_state The state to leave the library in on success.
+ *
+ * @return ESP_OK on success, ESP_FAIL otherwise.
+ */
+static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
+                                         void* msg_handler_args, bool auto_sync,
+                                         uint16_t watchdog_timeout_seconds,
+                                         bluecherry_state initial_state)
+{
   _bluecherry_opdata.msg_handler = msg_handler;
   _bluecherry_opdata.msg_handler_args = msg_handler_args;
 
@@ -2076,8 +2250,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     ESP_LOGE(TAG, "Could not setup Mbed TLS context");
     goto fail;
   }
-  if(!_bluecherry_configure_credentials(BLUECHERRY_CA, device_cert, device_key)) {
-    ESP_LOGE(TAG, "Could not configure credentials");
+  if(!_bluecherry_configure_ca(BLUECHERRY_CA)) {
+    ESP_LOGE(TAG, "Could not configure the CA chain");
     goto fail;
   }
 
@@ -2107,19 +2281,52 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
   if(auto_sync) {
     BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync", 4096, NULL, BLUECHERRY_SP, NULL);
     if(ret != pdPASS) {
-      vQueueDelete(_bluecherry_opdata.out_queue);
-      _bluecherry_opdata.out_queue = NULL;
+      ESP_LOGE(TAG, "Could not start the synchronisation task");
       goto fail;
     }
   }
 
-  _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+  _bluecherry_opdata.state = initial_state;
   return ESP_OK;
 
 fail:
+  /* The queue is freed here too. It used to survive these paths, so a caller that retried
+   * init leaked one queue per attempt. */
+  if(_bluecherry_opdata.out_queue != NULL) {
+    vQueueDelete(_bluecherry_opdata.out_queue);
+    _bluecherry_opdata.out_queue = NULL;
+  }
   _bluecherry_cleanup_network();
   _bluecherry_cleanup_mbedtls();
   return ESP_FAIL;
+}
+
+esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
+                          bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
+                          bool auto_sync, uint16_t watchdog_timeout_seconds)
+{
+  if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED)
+    return ESP_OK;
+
+  if(device_cert == NULL || device_key == NULL) {
+    ESP_LOGE(TAG, "A device certificate and key are required");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t ret =
+      _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
+                              BLUECHERRY_STATE_AWAIT_CONNECTION);
+  if(ret != ESP_OK) {
+    return ret;
+  }
+
+  if(!_bluecherry_configure_own_cert(device_cert, device_key)) {
+    ESP_LOGE(TAG, "Could not configure device credentials");
+    _bluecherry_opdata.state = BLUECHERRY_STATE_UNINITIALIZED;
+    return ESP_FAIL;
+  }
+
+  return ESP_OK;
 }
 
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
@@ -2131,80 +2338,47 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
     return ESP_OK;
   }
 
-  bcTypeId = bc_device_type;
-
-  // Get existing device credentials using the provided BIO handler
-  const char* device_cert = ztp_bio_handler(true, false, NULL);
-  const char* device_key = ztp_bio_handler(true, true, NULL);
-
-  if(device_cert == NULL || device_key == NULL) {
-    ESP_LOGW(TAG, "Device is not provisioned for BlueCherry communication, starting ZTP...");
-
-    uint8_t mac[8] = { 0 };
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-
-    if(!_bluecherry_setup_mbedtls(mac)) {
-      ESP_LOGE(TAG, "(ZTP) Could not setup Mbed TLS context");
-      goto fail;
-    }
-    if(!_bluecherry_configure_credentials(BLUECHERRY_CA, NULL, NULL)) {
-      ESP_LOGE(TAG, "(ZTP) Could not configure credentials");
-      goto fail;
-    }
-    if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_ZTP_PORT)) {
-      ESP_LOGE(TAG, "(ZTP) Could not connect to BlueCherry server");
-      goto fail;
-    }
-
-    ESP_LOGI(TAG, "Connected to ZTP server");
-
-    if(!_ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
-      ESP_LOGE(TAG, "(ZTP) Could not add MAC address as ZTP device ID parameter");
-      goto fail;
-    }
-
-    if(!_ztp_request_device_id()) {
-      ESP_LOGE(TAG, "(ZTP) Could not request device ID");
-      goto fail;
-    }
-
-    if(!_ztp_generate_key_and_csr()) {
-      ESP_LOGE(TAG, "(ZTP) Could not generate private key");
-      goto fail;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    if(!_ztp_request_signed_certificate()) {
-      ESP_LOGE(TAG, "(ZTP) Could not request signed certificate");
-      goto fail;
-    }
-
-    const char* new_cert = ztp_certBuf;
-    const char* new_key = ztp_pkeyBuf;
-
-    // Store the new credentials using the provided BIO handler
-    ztp_bio_handler(false, false, (void*) new_cert);
-    ztp_bio_handler(false, true, (void*) new_key);
-
-    device_cert = new_cert;
-    device_key = new_key;
+  if(ztp_bio_handler == NULL || bc_device_type == NULL) {
+    ESP_LOGE(TAG, "A credential storage handler and a device type are required");
+    return ESP_ERR_INVALID_ARG;
   }
 
-  return bluecherry_init(device_cert, device_key, msg_handler, msg_handler_args, auto_sync,
-                         watchdog_timeout_seconds);
+  bcTypeId = bc_device_type;
+  _bluecherry_opdata.ztp_bio_handler = ztp_bio_handler;
+  _bluecherry_opdata.ztp_bio_handler_args = ztp_bio_handler_args;
 
-fail:
-  _bluecherry_cleanup_network();
-  _bluecherry_cleanup_mbedtls();
-  _bluecherry_opdata.ztp_devIdParams.count = 0;
-  return ESP_FAIL;
+  /* Nothing here talks to the network. Reading the stored credentials and, if there are none,
+   * provisioning this device both happen on the first bluecherry_sync — so this call cannot
+   * fail because the cloud is unreachable, and the caller does not have to retry it. */
+  return _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
+                                 BLUECHERRY_STATE_NOT_PROVISIONED);
 }
 
 esp_err_t bluecherry_sync(bool blocking)
 {
   static int64_t lastRetryTimeUs = 0;
   static uint32_t retryIntervalMs = 100;
+  static int64_t lastProvisionTimeUs = 0;
+  static uint32_t provisionIntervalMs = 100;
+
+  /* Obtain credentials before anything else. This is backoff-gated on its own timer rather
+   * than sharing the connect one, so a provisioning service that is down does not also
+   * throttle the reconnects of a device that is already provisioned. */
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
+    int64_t nowUs = esp_timer_get_time();
+    if(((nowUs - lastProvisionTimeUs) / 1000) < provisionIntervalMs) {
+      return ESP_ERR_NOT_FINISHED;
+    }
+    lastProvisionTimeUs = nowUs;
+
+    if(!_bluecherry_provision()) {
+      provisionIntervalMs = (provisionIntervalMs < 30000) ? provisionIntervalMs * 2 : 30000;
+      return ESP_ERR_NOT_FINISHED;
+    }
+
+    provisionIntervalMs = 100;
+    _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+  }
 
   // (re)connect if needed with exponential backoff (non-blocking)
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_AWAIT_CONNECTION) {
@@ -2225,32 +2399,23 @@ esp_err_t bluecherry_sync(bool blocking)
        * chunk 0 on a new session, so keeping otaProgress would resume writing
        * at a stale offset and quietly corrupt the image — and unfixable any
        * other way, because sequential chunks carry no offset to re-sync
-       * against. A protocol reply from the dead session is equally
-       * meaningless, so the priority slot goes with it.
-       *
-       * INIT_INFO is the one exception. It is queued once at init and
-       * describes the image this device booted rather than anything about the
-       * session, so it is kept until it has actually been sent — otherwise a
-       * device that takes several attempts to connect would drop it. */
+       * against. A protocol reply from the dead session is
+       * equally meaningless, so the priority slot goes with it. */
       _bluecherry_ota_reset();
-      if(_bluecherry_opdata.pending_event_len > 0) {
-        const uint8_t pending_event_type =
-            _bluecherry_opdata
-                .pending_event[BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE];
-        if(pending_event_type != BLUECHERRY_EVENT_TYPE_INIT_INFO) {
-          _bluecherry_opdata.pending_event_len = 0;
-        }
-      }
+      _bluecherry_opdata.pending_event_len = 0;
 
-      _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
+      _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
       retryIntervalMs = 100;
+
+      /* Report the running image on every connect, not only at boot. */
+      _bluecherry_send_init_info();
     } else {
       return ESP_ERR_NOT_FINISHED;
     }
   }
 
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED ||
-     _bluecherry_opdata.state == BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE) {
+     _bluecherry_opdata.state == BLUECHERRY_STATE_AWAITING_RESPONSE) {
     ESP_LOGE(TAG, "Cannot sync in the current state");
     return ESP_ERR_INVALID_STATE;
   }
@@ -2395,12 +2560,12 @@ esp_err_t bluecherry_sync(bool blocking)
 
   if(want_resync) {
     ESP_LOGD(TAG, "Synchronized messages with cloud");
-    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES;
+    _bluecherry_opdata.state = BLUECHERRY_STATE_PENDING_MESSAGES;
     return BLUECHERRY_SYNC_CONTINUE;
   }
 
   ESP_LOGD(TAG, "Synchronized messages with cloud");
-  _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
+  _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
   return ESP_OK;
 }
 

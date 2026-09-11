@@ -149,6 +149,25 @@ extern "C" {
 #define BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS 3
 
 /**
+ * @brief Bytes skipped at the head of a ZTP CoAP response.
+ *
+ * The ZTP exchange does not parse its responses; it skips a fixed header and treats the
+ * remainder as the CBOR payload. Any change to the server's response header silently
+ * corrupts the payload, so this constant is a contract with the ZTP service.
+ */
+#define BLUECHERRY_ZTP_RSP_HEADER_LEN 7
+
+/**
+ * @brief The size of the ZTP transmit buffer.
+ *
+ * Sized to hold the largest ZTP request, which is the CSR: a CoAP header, the payload
+ * marker and BLUECHERRY_ZTP_CERT_BUF_SIZE bytes of DER, with room to spare. A fixed buffer
+ * rather than a VLA, so the stack cost is visible at compile time instead of depending on a
+ * length computed at run time.
+ */
+#define BLUECHERRY_ZTP_TX_BUF_SIZE (BLUECHERRY_ZTP_CERT_BUF_SIZE + 64)
+
+/**
  * @brief Header of the function that handles reading/writing of certificates and keys
  * for zero-touch provisioning.
  *
@@ -188,15 +207,47 @@ typedef enum {
 
 /**
  * @brief The different states the BlueCherry connection can be in.
+ *
+ * The progression is linear: nothing allocated, no credentials, credentials but no session,
+ * session up. Only bluecherry_sync moves between them, and it is the only thing that touches
+ * the network — bluecherry_init allocates and never connects.
  */
 typedef enum {
+  /**
+   * @brief Nothing has been allocated yet.
+   */
   BLUECHERRY_STATE_UNINITIALIZED = 0,
+
+  /**
+   * @brief Allocated, but no device credentials are available yet.
+   *
+   * The next bluecherry_sync reads them through the storage handler and, if they are absent,
+   * provisions this device before going on to connect.
+   */
+  BLUECHERRY_STATE_NOT_PROVISIONED,
+
+  /**
+   * @brief Credentials are loaded but there is no live session.
+   */
   BLUECHERRY_STATE_AWAIT_CONNECTION,
-  BLUECHERRY_STATE_CONNECTED_IDLE,
-  BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE,
-  BLUECHERRY_STATE_CONNECTED_TIMED_OUT,
-  BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK,
-  BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES
+
+  /**
+   * @brief Session up, nothing outstanding.
+   */
+  BLUECHERRY_STATE_IDLE,
+
+  /**
+   * @brief A confirmable message is on the wire.
+   *
+   * Set for the duration of a request/response exchange so a second, concurrent call to
+   * bluecherry_sync is rejected rather than corrupting the exchange.
+   */
+  BLUECHERRY_STATE_AWAITING_RESPONSE,
+
+  /**
+   * @brief The server signalled that it still has data queued for this device.
+   */
+  BLUECHERRY_STATE_PENDING_MESSAGES
 } bluecherry_state;
 
 /**
@@ -224,24 +275,41 @@ typedef enum {
   // 1..3 are the OTA messages the cloud sends before it knows what this client
   // speaks. It implements none of them: 1 is answered with the probe reply (see
   // BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL) and 2 and 3 are discarded.
-  BLUECHERRY_EVENT_TYPE_OTA_PROBE = 1, // Server -> Client: the cloud's opening OTA message, which this client answers to announce the protocol it speaks.
-  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_CHUNK = 2, // Server -> Client: image data in a form this client does not accept. Discarded.
-  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_FINISH = 3, // Server -> Client: end of an image this client never accepted. Discarded.
-  BLUECHERRY_EVENT_TYPE_ERROR = 4, // Client -> Server: a topic 0x00 handler failed. Historically payload-less; a reason byte may be appended, see BLUECHERRY_OTA_ERROR_*.
-  // MOTA 5..8: modem firmware update. Not implemented in this client, but fully
-  // implemented in the Walter cellular firmware, where it shares otaSize,
-  // otaProgress and ota_buffer with the ESP32 OTA path. Never reuse these.
+  BLUECHERRY_EVENT_TYPE_OTA_PROBE = 1, // Server -> Client: the cloud's opening OTA message, which
+                                       // this client answers to announce the protocol it speaks.
+  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_CHUNK =
+      2, // Server -> Client: image data in a form this client does not accept. Discarded.
+  BLUECHERRY_EVENT_TYPE_OTA_UNSUPPORTED_FINISH =
+      3, // Server -> Client: end of an image this client never accepted. Discarded.
+  BLUECHERRY_EVENT_TYPE_ERROR =
+      4, // Client -> Server: a topic 0x00 handler failed. Historically payload-less; a reason byte
+         // may be appended, see BLUECHERRY_OTA_ERROR_*.
+  // MOTA 5..8: modem firmware update. Not implemented here, but reserved by the
+  // protocol and in use elsewhere, where it shares its transfer state with the
+  // application OTA path. Never reuse these.
   // MOTA RESERVED, 5
   // MOTA RESERVED, 6
   // MOTA RESERVED, 7
   // MOTA RESERVED, 8
-  BLUECHERRY_EVENT_TYPE_PARTITION_HASH = 9, // Client -> Server: Sends the currently running partition hash to the server. Server can use this to verify if an OTA was received.
-  BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE = 10, // Server -> Client: Informs the client an OTA update is available. Server reports the total size, hash, and version number
-  BLUECHERRY_EVENT_TYPE_OTA_START = 11, // Client -> Server: Requests the start of the OTA update. Echoes back the version number so the server can verify it matches the intended update.
+  BLUECHERRY_EVENT_TYPE_PARTITION_HASH =
+      9, // Client -> Server: Sends the currently running partition hash to the server. Server can
+         // use this to verify if an OTA was received.
+  BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE =
+      10, // Server -> Client: Informs the client an OTA update is available. Server reports the
+          // total size, hash, and version number
+  BLUECHERRY_EVENT_TYPE_OTA_START =
+      11, // Client -> Server: Requests the start of the OTA update. Echoes back the version number
+          // so the server can verify it matches the intended update.
   BLUECHERRY_EVENT_TYPE_OTA_CHUNK = 12, // Server -> Client: Sends a chunk of the OTA update
-  BLUECHERRY_EVENT_TYPE_OTA_VERIFIED = 13, // Client -> Server: Informs the server that the OTA update has been fully received and checksum has been verified. (ready for reboot)
-  BLUECHERRY_EVENT_TYPE_OTA_ERROR = 14, // Client -> Server: Informs the Server that an error occurred during the OTA update, and that the update should stop. Can be thrown at any time during the download, or at the verification step. (Server will re-try ota up until max 3 times)
-  BLUECHERRY_EVENT_TYPE_INIT_INFO = 15 // Client -> Server: Sends initial information about the client to the server.
+  BLUECHERRY_EVENT_TYPE_OTA_VERIFIED =
+      13, // Client -> Server: Informs the server that the OTA update has been fully received and
+          // checksum has been verified. (ready for reboot)
+  BLUECHERRY_EVENT_TYPE_OTA_ERROR =
+      14, // Client -> Server: Informs the Server that an error occurred during the OTA update, and
+          // that the update should stop. Can be thrown at any time during the download, or at the
+          // verification step. (Server will re-try ota up until max 3 times)
+  BLUECHERRY_EVENT_TYPE_INIT_INFO =
+      15 // Client -> Server: Sends initial information about the client to the server.
 } _bluecherry_event_type;
 
 /**
@@ -251,8 +319,8 @@ typedef enum {
  * nothing this client accepts until it is answered with [4][0xB2].
  *
  * The reply must be EXACTLY those two bytes. A one-byte [4] is the historic
- * payload-less error that Walter firmware emits on any topic 0x00 failure, and
- * the length is all that keeps the two apart.
+ * payload-less error reported on any topic 0x00 failure, and the length is all
+ * that keeps the two apart.
  */
 #define BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL 0xB2
 
@@ -295,7 +363,7 @@ typedef enum {
  *
  * Changing the list: a field may be repurposed in place only if its width is
  * unchanged. A width change must RETIRE the bit and use the next free one, or a
- * stale peer misparses every field after it. See OTA_V2_DESIGN.md.
+ * stale peer misparses every field after it.
  */
 #define BLUECHERRY_INIT_INFO_SCHEMA 1
 
@@ -323,10 +391,9 @@ typedef enum {
 /**
  * @brief Which BlueCherry library this is, and its version.
  *
- * The name is the point: several libraries share every toolchain — BlueCherry
- * on esp-idf, zephyr and linux, WalterModem on esp-idf and arduino — so the
- * platform enum cannot identify the sender and a bare version number means
- * nothing without it. A sibling library changes this one string.
+ * The name is the point: more than one client library can be built for the same
+ * toolchain, so the platform enum cannot identify the sender and a bare version
+ * number means nothing without it. A different library changes this one string.
  */
 #define BLUECHERRY_LIB_NAME "BlueCherry"
 #define BLUECHERRY_LIB_VERSION_MAJOR 1
@@ -349,17 +416,17 @@ typedef enum {
  * platform with no such concept.
  *
  * The field carries a platform-neutral slot index rather than an ESP partition
- * subtype, so the zephyr and linux libraries do not have to fake an ESP
- * encoding.
+ * subtype, so that a platform with a different flash layout does not have to
+ * fake an ESP encoding to report it.
  */
 #define BLUECHERRY_OTA_SLOT_NONE 0xFF
 
 /**
  * @brief Client toolchain reported in INIT_INFO.
  *
- * The toolchain, not the board: Walter is ESP-IDF and has no code of its own
- * here. ARDUINO is reported when that macro is defined, which is technically
- * still an ESP-IDF wrapper but is the useful thing to know.
+ * The toolchain, not the board — a board built on ESP-IDF reports ESP-IDF
+ * whatever else is on it. ARDUINO is reported when that macro is defined, which
+ * is technically still an ESP-IDF wrapper but is the useful thing to know.
  */
 typedef enum {
   BLUECHERRY_PLATFORM_UNKNOWN = 0,
@@ -703,6 +770,19 @@ typedef struct {
   void* msg_handler_args;
 
   /**
+   * @brief The credential storage handler, or NULL when not using provisioning.
+   *
+   * Retained after init because provisioning now happens in bluecherry_sync, which needs to
+   * read the stored credentials and write back the ones it is issued.
+   */
+  bluecherry_ztp_bio_handler_t ztp_bio_handler;
+
+  /**
+   * @brief Optional user arguments to pass to the credential storage handler.
+   */
+  void* ztp_bio_handler_args;
+
+  /**
    * @brief The current CoAP message id that is used.
    */
   uint16_t cur_message_id;
@@ -813,9 +893,11 @@ typedef struct {
 } _bluecherry_t;
 
 /**
- * @brief Initialize the BlueCherry subsystem without ZTP.
+ * @brief Initialize the BlueCherry subsystem with an existing device certificate.
  *
- * This function will initialize the BlueCherry IoT module without zero-touch provisioning enabled.
+ * Reserves the outgoing queue, the TLS contexts and — when auto_sync is set — the
+ * synchronisation task. It does not touch the network: the connection is established by the
+ * first bluecherry_sync, so this call cannot fail because the cloud is unreachable.
  *
  * @param device_cert The BlueCherry device certificate in PEM format.
  * @param device_key The BlueCherry device certificate's key in PEM format.
@@ -833,9 +915,13 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
                           bool auto_sync, uint16_t watchdog_timeout_seconds);
 
 /**
- * @brief Initialize the BlueCherry subsystem with ZTP.
+ * @brief Initialize the BlueCherry subsystem with zero-touch provisioning.
  *
- * This function will initialize the BlueCherry IoT module without zero-touch provisioning enabled.
+ * Reserves the same resources as bluecherry_init and returns immediately. Reading the stored
+ * credentials, and provisioning this device when there are none, both happen on the first
+ * bluecherry_sync — so this call does not touch the network and does not need to be retried
+ * in a loop. A provisioning failure is reported by bluecherry_sync instead, which keeps
+ * trying with a growing back-off.
  *
  * @param ztp_bio_handler The handler used for reading/writing keys and certificates. This must be
  * implemented by the application.
@@ -848,7 +934,7 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
  * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
  * Should be more than 30 seconds
  *
- * @return ESP_OK on success.
+ * @return ESP_OK once initialized, ESP_ERR_INVALID_ARG on a missing handler or device type.
  */
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
                               void* ztp_bio_handler_args, const char* bc_device_type,
@@ -858,13 +944,21 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
 /**
  * @brief Synchronize incoming and outgoing BlueCherry messages and perform OTA.
  *
- * This function will communicate with the BlueCherry cloud and send any enqueued MQTT messages,
- * check if there are any incoming MQTT messages and check for OTA updates.
+ * This is the only function that uses the network. In order, it provisions the device when it
+ * has no credentials yet, opens the connection when there is none, sends one enqueued message,
+ * and dispatches whatever came back — incoming messages to the message handler and firmware
+ * updates to the OTA machinery.
+ *
+ * It works the same whether the application calls it itself or the automatic synchronisation
+ * task does. Each step is back-off gated and returns ESP_ERR_NOT_FINISHED rather than blocking
+ * until it succeeds, so calling this in a loop is what drives a device from freshly booted to
+ * connected.
  *
  * @param blocking When true, the function will block until a message is sent or received, or the
  *                  BLUECHERRY_AUTO_SYNC_SECONDS timeout expires.
  *
- * @return ESP_OK when finished, BLUECHERRY_SYNC_CONTINUE when more messages are pending.
+ * @return ESP_OK when finished, BLUECHERRY_SYNC_CONTINUE when more messages are pending,
+ * ESP_ERR_NOT_FINISHED while still provisioning or connecting.
  */
 esp_err_t bluecherry_sync(bool blocking);
 

@@ -13,5 +13,5 @@ example allows for:
 
 ## Licence 
 
-The library is published under the 'GNU GENERAL PUBLIC LICENSE'. The full license text can be read
-[here](license.md).
+The library is published under the 'GNU LESSER GENERAL PUBLIC LICENSE'. The full license text can
+be read [here](LICENSE.md).

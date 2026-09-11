@@ -39,6 +39,10 @@
 
 /**
  * @brief The BlueCherry device type for this application. Required for ZTP.
+ *
+ * Replace this with the device type issued to you on the BlueCherry platform. It is eight
+ * characters and forms the first half of this device's identity, so provisioning fails if it
+ * does not name a type that exists in your account.
  */
 #define BLUECHERRY_DEVICE_TYPE "walter01"
 
@@ -481,17 +485,11 @@ void app_main(void)
   bluecherry_ota_set_handler(bluecherry_ota_handler, NULL);
 
   /* Initialize bluecherry with pre-provisioned keys */
-  // while (!bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30)) {
-  //   ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
-  //   vTaskDelay(pdMS_TO_TICKS(5000));
-  // }
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
 
-  /* Initialize bluecherry with zero-touch provisioning */
-  while(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
-                            bluecherry_msg_handler, NULL, true, 30) != ESP_OK) {
-    ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-  }
+  /* Initialize bluecherry with zero-touch provisioning. */
+  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
+                                      bluecherry_msg_handler, NULL, true, 30));
 
   while(true) {
     ESP_LOGI(TAG, "Publishing message");
