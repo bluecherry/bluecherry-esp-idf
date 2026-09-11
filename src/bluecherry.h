@@ -75,7 +75,7 @@ extern "C" {
  */
 #define BLUECHERRY_MAX_MESSAGE_LEN 1024
 
-/*
+/**
  * @brief The timeout in seconds for a SSL handshake to complete.
  */
 #define SSL_HANDSHAKE_TIMEOUT_SEC 30
@@ -94,16 +94,11 @@ extern "C" {
  * every other array size in this header is a #define.
  *
  * 5 header + 2 framing + 128 payload. The largest internal event is INIT_INFO,
- * whose worst case is about 83 bytes once its variable-length strings are
- * counted; the payload budget is deliberately well clear of that so a longer
- * MCU name or reset reason cannot silently push it over. Over budget is not a
- * crash but it is worse than it looks: _bluecherry_publish_event returns
- * ESP_ERR_INVALID_SIZE, the caller only debug-logs that, and the result is a
- * silently missing INIT_INFO — losing the running-partition hash, which is the
- * one field in it the server actually acts on.
- *
- * _bluecherry_publish_event bounds-checks against sizeof() rather than against
- * this constant, so the two cannot drift apart dangerously.
+ * which runs to about 84 bytes in practice. Its absolute worst case — three
+ * BLUECHERRY_INFO_STR_MAX strings — is 153 and does NOT fit; that is safe only
+ * because _bluecherry_info_add_str drops a field it cannot fit rather than
+ * writing half of one. See the _Static_assert in _bluecherry_send_init_info for
+ * the part that must fit unconditionally.
  */
 #define BLUECHERRY_EVENT_PAYLOAD_MAX 128
 #define BLUECHERRY_PENDING_EVENT_SIZE (5 + 2 + BLUECHERRY_EVENT_PAYLOAD_MAX)
@@ -152,11 +147,6 @@ extern "C" {
  * @brief The maximum number of device identification parameters.
  */
 #define BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS 3
-
-/**
- * @brief The maximum time in seconds to wait for a CoAP ring.
- */
-#define BLUECHERRY_ZTP_COAP_TIMEOUT 30
 
 /**
  * @brief Header of the function that handles reading/writing of certificates and keys
@@ -255,14 +245,10 @@ typedef enum {
 } _bluecherry_event_type;
 
 /**
- * @brief Reason byte appended to BLUECHERRY_EVENT_TYPE_ERROR.
+ * @brief Reason byte appended to BLUECHERRY_EVENT_TYPE_ERROR: the probe reply.
  *
- * BLUECHERRY_OTA_ERROR_UNSUPPORTED_PROTOCOL is the probe reply, and the only
- * place in this client where a second OTA protocol is acknowledged at all: the
- * cloud still serves an older generation of devices, so it opens every OTA with
- * BLUECHERRY_EVENT_TYPE_OTA_PROBE, and answering that with [4][0xB2] is what
- * tells it to use the protocol implemented here. Until it receives that reply it
- * sends nothing this client accepts — which is what keeps older firmware safe.
+ * The cloud opens every OTA with BLUECHERRY_EVENT_TYPE_OTA_PROBE and sends
+ * nothing this client accepts until it is answered with [4][0xB2].
  *
  * The reply must be EXACTLY those two bytes. A one-byte [4] is the historic
  * payload-less error that Walter firmware emits on any topic 0x00 failure, and
@@ -307,19 +293,9 @@ typedef enum {
  * They are PURELY INFORMATIONAL: the server logs them and never makes a
  * decision on them. Only the hash is acted upon.
  *
- * Two rules for changing this list, and the difference matters:
- *
- *   - A field whose width is unchanged may be repurposed in place. The worst a
- *     stale peer can then produce is a mislabelled value, never a misparse.
- *     BLUECHERRY_INFO_BIT_TOTAL_HEAP was free heap and is now total heap.
- *   - A field whose width changes must be RETIRED and the replacement given the
- *     next free bit. Bit 2 was a one-byte reset reason and is now a string on
- *     bit 10: reusing bit 2 would make a stale client's single byte decode as a
- *     length-1 string that swallows the next field's first byte, and every
- *     field after it would be silently wrong. Retired, a mismatched pair stops
- *     dead at an unknown bit instead — a parser cannot locate anything past a
- *     bit whose width it does not know. Bits are cheap; a silent misparse is
- *     not.
+ * Changing the list: a field may be repurposed in place only if its width is
+ * unchanged. A width change must RETIRE the bit and use the next free one, or a
+ * stale peer misparses every field after it. See OTA_V2_DESIGN.md.
  */
 #define BLUECHERRY_INIT_INFO_SCHEMA 1
 
@@ -354,8 +330,8 @@ typedef enum {
  */
 #define BLUECHERRY_LIB_NAME "BlueCherry"
 #define BLUECHERRY_LIB_VERSION_MAJOR 1
-#define BLUECHERRY_LIB_VERSION_MINOR 4
-#define BLUECHERRY_LIB_VERSION_PATCH 0
+#define BLUECHERRY_LIB_VERSION_MINOR 3
+#define BLUECHERRY_LIB_VERSION_PATCH 4
 
 /**
  * @brief The MCU this was built for, as a string.
@@ -399,9 +375,10 @@ typedef enum {
  */
 typedef enum {
   BLUECHERRY_OTA_STATE_IDLE = 0,
-  BLUECHERRY_OTA_STATE_OFFERED,     /* INITIALIZE received, waiting on the application */
-  BLUECHERRY_OTA_STATE_DOWNLOADING, /* START sent, chunks arriving */
-  BLUECHERRY_OTA_STATE_COMPLETE     /* verified, acked, boot partition set */
+  BLUECHERRY_OTA_STATE_OFFERED,           /* INITIALIZE received, waiting on the application */
+  BLUECHERRY_OTA_STATE_DOWNLOADING,       /* START sent, chunks arriving */
+  BLUECHERRY_OTA_STATE_AWAITING_VERIFIED, /* image written and hashed, VERIFIED queued */
+  BLUECHERRY_OTA_STATE_COMPLETE           /* verified, acked, boot partition set */
 } _bluecherry_ota_state;
 
 /**
@@ -411,10 +388,9 @@ typedef enum {
   /**
    * @brief An update is available; details are in bluecherry_ota_info_t.
    *
-   * Carries a decision: return false and the library starts the download at
-   * once, return true and nothing happens until the application calls
-   * bluecherry_ota_start(). There is no timeout, so waiting hours, or until
-   * 3am, is perfectly fine.
+   * Carries a decision: the download. Return true and nothing happens until
+   * bluecherry_ota_start() is called — there is no timeout, so waiting until
+   * 3am is fine.
    */
   BLUECHERRY_OTA_EVENT_AVAILABLE,
 
@@ -435,12 +411,9 @@ typedef enum {
    * boot partition is set. The device keeps running the OLD firmware until it
    * restarts.
    *
-   * Carries a decision: return false and the library reboots at once, return
-   * true and the reboot is yours — close valves, flush buffers, finish a
-   * measurement, then call esp_restart(). The boot partition is already set, so
-   * nothing else from this library is needed.
-   *
-   * Runs on the bc_sync task, so it must not block — signal your own task.
+   * Carries a decision: the reboot. Return true and it is yours — finish what
+   * you are doing, then call esp_restart(). Nothing else from this library is
+   * needed. Runs on the bc_sync task, so it must not block.
    */
   BLUECHERRY_OTA_EVENT_COMPLETE,
 
@@ -771,11 +744,6 @@ typedef struct {
   uint8_t otaSkipBuffer[ENCRYPTED_BLOCK_SIZE];
 
   /**
-   * @brief Flag used to signal an error.
-   */
-  bool emitErrorEvent;
-
-  /**
    * @brief The total size of the OTA image.
    */
   uint32_t otaSize;
@@ -815,28 +783,11 @@ typedef struct {
   int8_t otaTargetVersion;
 
   /**
-   * @brief Chunk size the server announced. Informational.
-   */
-  uint8_t otaChunkSize;
-
-  /**
-   * @brief Set while a VERIFIED is in flight. The send step commits the boot
-   * partition once that message is acknowledged, and not before.
-   */
-  bool otaAwaitingVerifiedAck;
-
-  /**
    * @brief Priority slot for one outgoing internal-channel (topic 0x00) frame.
    *
-   * Checked BEFORE out_queue in the send step, because bluecherry_sync sends
-   * one queued message per sync: a protocol reply left to queue behind
-   * CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES application publishes would
-   * be that many syncs away. Long enough, and the server would push an entire
-   * image in a form this client cannot accept before learning what it speaks.
-   *
-   * One slot is sufficient because every internal event is a reply the server
-   * then responds to, so only one is ever outstanding. A static buffer avoids
-   * the malloc/free dance of the application queue.
+   * Checked BEFORE out_queue in the send step — see bluecherry_sync for why.
+   * One slot suffices because every internal event is a reply the server then
+   * responds to, so only one is ever outstanding.
    */
   uint8_t pending_event[BLUECHERRY_PENDING_EVENT_SIZE];
 
@@ -938,14 +889,9 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data);
  * one is offered and reboots as soon as it is installed, so an application that
  * never calls this still receives updates.
  *
- * The two decisions are independently deferrable, and a handler takes only the
- * ones it returns true for. One that returns true from
- * BLUECHERRY_OTA_EVENT_AVAILABLE and false elsewhere controls when the download
- * happens but lets the library reboot; one that returns true only from
- * BLUECHERRY_OTA_EVENT_COMPLETE controls the reboot but downloads immediately;
- * one that returns false throughout just watches.
- *
- * The handler runs on the bc_sync task and must not block.
+ * The two decisions are independently deferrable — see
+ * bluecherry_ota_handler_t. The handler runs on the bc_sync task and must not
+ * block.
  *
  * @param handler The handler, or NULL to hand control back to the library.
  * @param args Optional user pointer passed to the handler.

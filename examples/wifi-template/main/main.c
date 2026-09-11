@@ -321,24 +321,10 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
 /**
  * @brief Watch OTA updates without taking any of the decisions.
  *
- * A handler is optional. This one exists purely to log, so it returns false
- * everywhere and the library keeps deciding: an update downloads the moment it
- * is offered and the device reboots the moment it is installed. Registering
- * this changes nothing about how the device updates, which is the point —
- * watching an update must not be able to stop one.
- *
- * To take a decision instead, return true from the event that carries it:
- *
- *   - BLUECHERRY_OTA_EVENT_AVAILABLE: return true and call
- *     bluecherry_ota_start() when it suits — the machine is idle, mains power
- *     is up, or it is 3am. The offer does not expire, so hours later is fine.
- *     bluecherry_ota_abort() declines it instead.
- *   - BLUECHERRY_OTA_EVENT_COMPLETE: return true and call esp_restart()
- *     yourself once valves are closed and buffers flushed. The boot partition
- *     is already set; until the restart the OLD firmware keeps running.
- *
- * Either way this runs on the bc_sync task and must not block — set a flag and
- * let your own task act on it.
+ * A handler is optional and this one only logs, so it returns false everywhere
+ * and the library keeps deciding: download on offer, reboot on install. To take
+ * a decision instead, return true from the event that carries it — see
+ * bluecherry_ota_handler_t.
  *
  * @param event The OTA event.
  * @param info Details for the event, valid only for this call.
