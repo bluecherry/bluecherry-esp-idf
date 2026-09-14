@@ -39,13 +39,17 @@
 
 /**
  * @brief The BlueCherry device type for this application. Required for ZTP.
+ *
+ * Replace this with the device type issued to your organization on the BlueCherry platform. It is
+ * eight characters and forms the first half of this device's identity, so provisioning fails if it
+ * does not name a type that exists.
  */
 #define BLUECHERRY_DEVICE_TYPE "walter01"
 
 /**
- * @brief The logging tag for this BlueCherry module.
+ * @brief The logging tag for this application.
  */
-static const char* TAG = "BlueCherry";
+static const char* TAG = "EXAMPLE";
 
 /**
  * @brief The network interface used to connect to the WiFi.
@@ -325,14 +329,14 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
  * the two calls involved are visible and easy to move:
  *
  *  - AVAILABLE: bluecherry_ota_start() accepts the update. Returning true means "I have this",
- *    so nothing is downloaded until that call is made — which is where you would instead stash
+ *    so nothing is downloaded until that call is made - which is where you would instead stash
  *    the offer and start it at 3am, on battery power, or once your machine is idle.
  *  - COMPLETE: the new image is installed and the boot target is already set, so the only thing
  *    left is when to restart. Returning true means the library will not do it for you.
  *
  * Returning false from either event hands that decision back: the library downloads on offer
  * and restarts on install, which is what happens when no handler is registered at all. That is
- * the point of the return value — a handler that only logs is free to return false everywhere
+ * the point of the return value - a handler that only logs is free to return false everywhere
  * and change nothing. The other three events are notifications and the return is ignored.
  *
  * @param event The OTA event.
@@ -346,9 +350,9 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
 {
   switch(event) {
   case BLUECHERRY_OTA_EVENT_AVAILABLE:
-    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes — accepting", info->version, info->size);
-    /* Accept it now. Delay this call instead to update at a moment that suits you; the offer
-     * stays open until you do, and bluecherry_ota_abort() declines it. */
+    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes - accepting", info->version, info->size);
+    /* Accept now, or call this later to update when it suits you - there is no deadline, and
+     * this event repeats on every reconnect while the update is on offer. */
     bluecherry_ota_start();
     return true;
 
@@ -357,11 +361,13 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
     break;
 
   case BLUECHERRY_OTA_EVENT_PROGRESS:
-    ESP_LOGI(TAG, "OTA progress %lu / %lu bytes", info->bytes_received, info->size);
+    ESP_LOGI(TAG, "OTA progress %lu / %lu bytes (%lu%%)", info->bytes_received, info->size,
+             info->size ? (unsigned long) ((uint64_t) info->bytes_received * 100 / info->size)
+                        : 0UL);
     break;
 
   case BLUECHERRY_OTA_EVENT_COMPLETE:
-    ESP_LOGI(TAG, "Firmware v%d installed — restarting", info->version);
+    ESP_LOGI(TAG, "Firmware v%d installed - restarting", info->version);
     /* The boot target is already set, so this is only about timing. Finish what your
      * application is doing first if a restart here would interrupt it. */
     esp_restart();
@@ -438,7 +444,7 @@ static const char* bluecherry_ztp_bio_handler(bool read, bool secure, void* args
     esp_err_t err =
         nvs_read_str(keyname, secure ? devkey : devcert, secure ? sizeof(devkey) : sizeof(devcert));
     if(err != ESP_OK) {
-      ESP_LOGW(TAG, "No %s found in NVS (err=0x%x)", keyname, err);
+      ESP_LOGD(TAG, "No %s found in NVS (err=0x%x)", keyname, err);
       return NULL;
     }
     return secure ? devkey : devcert;
@@ -481,17 +487,11 @@ void app_main(void)
   bluecherry_ota_set_handler(bluecherry_ota_handler, NULL);
 
   /* Initialize bluecherry with pre-provisioned keys */
-  // while (!bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30)) {
-  //   ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
-  //   vTaskDelay(pdMS_TO_TICKS(5000));
-  // }
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
 
-  /* Initialize bluecherry with zero-touch provisioning */
-  while(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
-                            bluecherry_msg_handler, NULL, true, 30) != ESP_OK) {
-    ESP_LOGI(TAG, "Waiting for Initial bluecherry connection...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-  }
+  /* Initialize bluecherry with zero-touch provisioning. */
+  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
+                                      bluecherry_msg_handler, NULL, true, 30));
 
   while(true) {
     ESP_LOGI(TAG, "Publishing message");

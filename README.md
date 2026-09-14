@@ -60,13 +60,23 @@ void msg_handler(uint8_t topic, uint16_t len, const uint8_t *data, void *args)
   ESP_LOGI(TAG, "Received MQTT message of length %d on topic %02X: %.*s", len, topic, len, data);
 }
 
-bluecherry_init(device_cert, device_key, msg_handler, NULL, true);
+/* The last argument is the task watchdog timeout in seconds, 0 to leave it alone.
+ * This call reserves buffers and starts the background sync task; it does not touch the
+ * network, so it does not need to be retried when the cloud is unreachable. */
+bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60);
 
 while(true) {
   bluecherry_publish(0x84, strlen("Hello World") + 1, (const uint8_t*) "Hello World");
   vTaskDelay(pdMS_TO_TICKS(5000));
 } 
 ```
+
+Messages are queued, not sent: `bluecherry_publish` hands the payload to the outgoing queue and
+returns. `bluecherry_sync` is what talks to the cloud — the background task above calls it for
+you, or you can set `auto_sync` to false and call it yourself.
+
+If you would rather not handle certificates at all, `bluecherry_init_ztp` provisions the device
+on first use and stores the issued certificate through a callback you supply.
 
 As you see the only thing that differs from regular MQTT is that topics are represented as a single
 byte instead of a string. The BlueCherry platform maps this byte to a topic string which also
@@ -84,10 +94,20 @@ paid cellular plains this is a huge win.
 The library is published under the 'GNU LESSER GENERAL PUBLIC LICENSE'. The full license text can 
 be read [here](license.md).
 
+## Over-the-air updates
+
+Firmware updates are handled for you: when the platform offers one, the library downloads it,
+verifies the written image against the hash the cloud published, and reboots into it.
+
+An application that needs a say registers a handler with `bluecherry_ota_set_handler`. It is
+told when an update becomes available, how far along the download is, and when the new image is
+installed. Returning `true` from the handler means "I will decide this one" — which is how you
+defer a download to a quiet hour with `bluecherry_ota_start`, or postpone the reboot until it is
+safe. Returning `false`, or registering no handler at all, leaves the library to get on with it.
+`bluecherry_ota_abort` gives up on an update in progress.
+
 ## Roadmap
 
 On the roadmap for this library is the following:
- - Implement the OTA functionality
- - Implement the ZTP functionality
  - Implement the session resumption functionality after deep sleep
  - Implement topic synchronisation.

@@ -8,6 +8,17 @@ menu "BLUECHERRY Configuration"
             Set the interval in seconds for automatic synchronization when no messages are published.
             Minimum is 1 second, maximum is 3600 seconds (1 hour).
 
+    config BLUECHERRY_SYNC_TASK_STACK_SIZE
+        int "Synchronisation Task Stack Size (bytes)"
+        default 8192
+        range 4096 32768
+        help
+            Stack for the background synchronisation task, which runs every network operation
+            this library performs. The deepest path is zero-touch provisioning: a DTLS
+            handshake with certificate chain verification, then CBOR exchanges holding up to
+            2.8 kB of buffers in nested frames, then SECP256R1 key generation. 4096 is not
+            enough for that and overflows. Lower it only if you never use ZTP.
+
     config BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES
         int "Max Pending Outgoing Messages"
         default 32
