@@ -329,14 +329,14 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
  * the two calls involved are visible and easy to move:
  *
  *  - AVAILABLE: bluecherry_ota_start() accepts the update. Returning true means "I have this",
- *    so nothing is downloaded until that call is made — which is where you would instead stash
+ *    so nothing is downloaded until that call is made - which is where you would instead stash
  *    the offer and start it at 3am, on battery power, or once your machine is idle.
  *  - COMPLETE: the new image is installed and the boot target is already set, so the only thing
  *    left is when to restart. Returning true means the library will not do it for you.
  *
  * Returning false from either event hands that decision back: the library downloads on offer
  * and restarts on install, which is what happens when no handler is registered at all. That is
- * the point of the return value — a handler that only logs is free to return false everywhere
+ * the point of the return value - a handler that only logs is free to return false everywhere
  * and change nothing. The other three events are notifications and the return is ignored.
  *
  * @param event The OTA event.
@@ -350,9 +350,9 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
 {
   switch(event) {
   case BLUECHERRY_OTA_EVENT_AVAILABLE:
-    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes — accepting", info->version, info->size);
-    /* Accept it now. Delay this call instead to update at a moment that suits you; the offer
-     * stays open until you do, and bluecherry_ota_abort() declines it. */
+    ESP_LOGI(TAG, "Firmware v%d available, %lu bytes - accepting", info->version, info->size);
+    /* Accept now, or call this later to update when it suits you - there is no deadline, and
+     * this event repeats on every reconnect while the update is on offer. */
     bluecherry_ota_start();
     return true;
 
@@ -361,11 +361,13 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
     break;
 
   case BLUECHERRY_OTA_EVENT_PROGRESS:
-    ESP_LOGI(TAG, "OTA progress %lu / %lu bytes", info->bytes_received, info->size);
+    ESP_LOGI(TAG, "OTA progress %lu / %lu bytes (%lu%%)", info->bytes_received, info->size,
+             info->size ? (unsigned long) ((uint64_t) info->bytes_received * 100 / info->size)
+                        : 0UL);
     break;
 
   case BLUECHERRY_OTA_EVENT_COMPLETE:
-    ESP_LOGI(TAG, "Firmware v%d installed — restarting", info->version);
+    ESP_LOGI(TAG, "Firmware v%d installed - restarting", info->version);
     /* The boot target is already set, so this is only about timing. Finish what your
      * application is doing first if a restart here would interrupt it. */
     esp_restart();

@@ -45,6 +45,7 @@
 #include <esp_random.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <inttypes.h>
 #include <esp_vfs.h>
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -88,20 +89,16 @@ extern "C" {
 /**
  * @brief Size of the priority slot holding one outgoing internal-channel frame.
  *
- * A macro, not the sum of BLUECHERRY_COAP_HEADER_SIZE and
- * BLUECHERRY_MQTT_HEADER_SIZE below: those are `static const size_t`, which is
- * not a constant expression in C and cannot size a struct member. Same reason
- * every other array size in this header is a #define.
- *
- * 5 header + 2 framing + 128 payload. The largest internal event is INIT_INFO,
- * which runs to about 84 bytes in practice. Its absolute worst case — three
- * BLUECHERRY_INFO_STR_MAX strings — is 153 and does NOT fit; that is safe only
+ * CoAP header + MQTT framing + 128 payload. The largest internal event is INIT_INFO,
+ * which runs to about 84 bytes in practice. Its absolute worst case - three
+ * BLUECHERRY_INFO_STR_MAX strings - is 153 and does NOT fit; that is safe only
  * because _bluecherry_info_add_str drops a field it cannot fit rather than
  * writing half of one. See the _Static_assert in _bluecherry_send_init_info for
  * the part that must fit unconditionally.
  */
 #define BLUECHERRY_EVENT_PAYLOAD_MAX 128
-#define BLUECHERRY_PENDING_EVENT_SIZE (5 + 2 + BLUECHERRY_EVENT_PAYLOAD_MAX)
+#define BLUECHERRY_PENDING_EVENT_SIZE                                                              \
+  (BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE + BLUECHERRY_EVENT_PAYLOAD_MAX)
 
 /**
  * @brief SPI flash sectors per erase block, usually large erase block is 32k/64k.
@@ -210,7 +207,7 @@ typedef enum {
  *
  * The progression is linear: nothing allocated, no credentials, credentials but no session,
  * session up. Only bluecherry_sync moves between them, and it is the only thing that touches
- * the network — bluecherry_init allocates and never connects.
+ * the network - bluecherry_init allocates and never connects.
  */
 typedef enum {
   /**
@@ -383,7 +380,7 @@ typedef enum {
  * @brief Longest string this client will put in one INIT_INFO field.
  *
  * A field that does not fit the remaining buffer is dropped rather than
- * truncated — a cleared presence bit is something the server renders correctly,
+ * truncated - a cleared presence bit is something the server renders correctly,
  * whereas a half-written string would misalign every field after it.
  */
 #define BLUECHERRY_INFO_STR_MAX 32
@@ -412,7 +409,7 @@ typedef enum {
 #endif
 
 /**
- * @brief ota_slot value meaning "not an OTA slot" — a factory boot, or a
+ * @brief ota_slot value meaning "not an OTA slot" - a factory boot, or a
  * platform with no such concept.
  *
  * The field carries a platform-neutral slot index rather than an ESP partition
@@ -424,7 +421,7 @@ typedef enum {
 /**
  * @brief Client toolchain reported in INIT_INFO.
  *
- * The toolchain, not the board — a board built on ESP-IDF reports ESP-IDF
+ * The toolchain, not the board - a board built on ESP-IDF reports ESP-IDF
  * whatever else is on it. ARDUINO is reported when that macro is defined, which
  * is technically still an ESP-IDF wrapper but is the useful thing to know.
  */
@@ -456,8 +453,11 @@ typedef enum {
    * @brief An update is available; details are in bluecherry_ota_info_t.
    *
    * Carries a decision: the download. Return true and nothing happens until
-   * bluecherry_ota_start() is called — there is no timeout, so waiting until
+   * bluecherry_ota_start() is called - there is no deadline, so waiting until
    * 3am is fine.
+   *
+   * Expect this event more than once: it is raised again every time the library
+   * reconnects to BlueCherry while the update is still on offer.
    */
   BLUECHERRY_OTA_EVENT_AVAILABLE,
 
@@ -468,7 +468,7 @@ typedef enum {
    * @brief Progress: bytes_received of size written so far. Carries no
    * decision.
    *
-   * Emitted once per batch that reaches flash, not once per received chunk —
+   * Emitted once per batch that reaches flash, not once per received chunk -
    * see bytes_received.
    */
   BLUECHERRY_OTA_EVENT_PROGRESS,
@@ -478,7 +478,7 @@ typedef enum {
    * boot partition is set. The device keeps running the OLD firmware until it
    * restarts.
    *
-   * Carries a decision: the reboot. Return true and it is yours — finish what
+   * Carries a decision: the reboot. Return true and it is yours - finish what
    * you are doing, then call esp_restart(). Nothing else from this library is
    * needed. Runs on the bc_sync task, so it must not block.
    */
@@ -533,7 +533,7 @@ typedef struct {
  *
  * A handler that returns false everywhere is therefore equivalent to
  * registering none at all: the library downloads on offer and reboots on
- * install, and the handler is pure observation. That is deliberate — watching
+ * install, and the handler is pure observation. That is deliberate - watching
  * an update must not be able to stop one.
  *
  * @param event The event that occurred.
@@ -553,13 +553,16 @@ static const UBaseType_t BLUECHERRY_SP = 10;
 
 /**
  * @brief The size of the BlueCherry CoAP header.
+ *
+ * A macro rather than a static const: both header sizes size local buffers and appear in
+ * _Static_assert, neither of which a const object can do in C.
  */
-static const size_t BLUECHERRY_COAP_HEADER_SIZE = 5;
+#define BLUECHERRY_COAP_HEADER_SIZE 5U
 
 /**
- * @brief The size the the BlueCherry MQTT header.
+ * @brief The size of the BlueCherry MQTT header.
  */
-static const size_t BLUECHERRY_MQTT_HEADER_SIZE = 2;
+#define BLUECHERRY_MQTT_HEADER_SIZE 2U
 
 /**
  * @brief The maximum number of CoAP retransmits.
@@ -586,7 +589,7 @@ typedef union {
    * @brief Pointer to the BlueCherry Type ID, as this is always programmed in
    * the application, no extra memory is required.
    */
-  const char* bcTypeId;
+  const char* bc_type_id;
 
   /**
    * @brief A MAC address used for authentication.
@@ -601,7 +604,7 @@ typedef union {
   /**
    * @brief A 64-bit OOB challenge.
    */
-  unsigned long long oobChallenge;
+  unsigned long long oob_challenge;
 } _bluecherry_ztp_device_id_value_t;
 
 /**
@@ -727,7 +730,7 @@ typedef struct {
   /**
    * @brief Mbed TLS CSR creation object.
    */
-  mbedtls_x509write_csr ztp_mbCsr;
+  mbedtls_x509write_csr ztp_mb_csr;
 
   /**
    * @brief The device key.
@@ -742,7 +745,7 @@ typedef struct {
   /**
    * @brief The device ZTP identification data.
    */
-  _bluecherry_ztp_device_id_t ztp_devIdParams;
+  _bluecherry_ztp_device_id_t ztp_dev_id_params;
 
   /**
    * @brief The CSR context.
@@ -810,38 +813,38 @@ typedef struct {
   /**
    * @brief Pointer to where the incoming OTA data should be saved.
    */
-  uint8_t otaBuffer[SPI_FLASH_SEC_SIZE];
+  uint8_t ota_buffer[SPI_FLASH_SEC_SIZE];
 
   /**
    * @brief The current position in the OTA buffer.
    */
-  uint32_t otaBufferPos;
+  uint32_t ota_buffer_pos;
 
   /**
    * @brief A buffer used to store the start of an OTA file, this is metadata and not actual
    * firmware data.
    */
-  uint8_t otaSkipBuffer[ENCRYPTED_BLOCK_SIZE];
+  uint8_t ota_skip_buffer[ENCRYPTED_BLOCK_SIZE];
 
   /**
    * @brief The total size of the OTA image.
    */
-  uint32_t otaSize;
+  uint32_t ota_size;
 
   /**
    * @brief The OTA progress in percent, 0 means that the OTA is not currently running.
    */
-  uint32_t otaProgress;
+  uint32_t ota_progress;
 
   /**
    * @brief The current OTA partition.
    */
-  const esp_partition_t* otaPartition;
+  const esp_partition_t* ota_partition;
 
   /**
    * @brief OTA state.
    */
-  _bluecherry_ota_state otaState;
+  _bluecherry_ota_state ota_state;
 
   /**
    * @brief The image SHA-256 the cloud says this update should have.
@@ -849,23 +852,23 @@ typedef struct {
    * All zeroes means no fingerprint is on record, so the download cannot be
    * checked against one. The hash is still computed and reported either way.
    */
-  uint8_t otaExpectedHash[BLUECHERRY_PARTITION_HASH_LEN];
+  uint8_t ota_expected_hash[BLUECHERRY_PARTITION_HASH_LEN];
 
   /**
-   * @brief True when otaExpectedHash is the all-zero "no fingerprint" sentinel.
+   * @brief True when ota_expected_hash is the all-zero "no fingerprint" sentinel.
    */
-  bool otaUnverified;
+  bool ota_unverified;
 
   /**
    * @brief The BlueCherry firmware version being installed, echoed back to the
    * server in START, VERIFIED and ERROR so it can tell which update we mean.
    */
-  int8_t otaTargetVersion;
+  int8_t ota_target_version;
 
   /**
    * @brief Priority slot for one outgoing internal-channel (topic 0x00) frame.
    *
-   * Checked BEFORE out_queue in the send step — see bluecherry_sync for why.
+   * Checked BEFORE out_queue in the send step - see bluecherry_sync for why.
    * One slot suffices because every internal event is a reply the server then
    * responds to, so only one is ever outstanding.
    */
@@ -880,7 +883,7 @@ typedef struct {
    * @brief The application's OTA handler, or NULL.
    *
    * NULL means the library decides for itself: start on offer, reboot on
-   * completion. So does a handler that returns false — the pointer says whether
+   * completion. So does a handler that returns false - the pointer says whether
    * anyone is watching, the return value says who decides, and only the second
    * of those can differ per event.
    */
@@ -895,7 +898,7 @@ typedef struct {
 /**
  * @brief Initialize the BlueCherry subsystem with an existing device certificate.
  *
- * Reserves the outgoing queue, the TLS contexts and — when auto_sync is set — the
+ * Reserves the outgoing queue, the TLS contexts and - when auto_sync is set - the
  * synchronisation task. It does not touch the network: the connection is established by the
  * first bluecherry_sync, so this call cannot fail because the cloud is unreachable.
  *
@@ -903,7 +906,8 @@ typedef struct {
  * @param device_key The BlueCherry device certificate's key in PEM format.
  * @param msg_handler The handler used for incoming messages or NULL to ignore them.
  * @param msg_handler_args Optional user pointer which is passed to the message handler.
- * @param auto_sync When set to true, the library will atomatically perform syncs in the background.
+ * @param auto_sync When set to true, the library will automatically perform syncs in the
+ * background.
  * @param watchdog_timeout_seconds The timeout in seconds for the task watchdog. If not 0, your
  * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
  * Should be more than 30 seconds
@@ -919,7 +923,7 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
  *
  * Reserves the same resources as bluecherry_init and returns immediately. Reading the stored
  * credentials, and provisioning this device when there are none, both happen on the first
- * bluecherry_sync — so this call does not touch the network and does not need to be retried
+ * bluecherry_sync - so this call does not touch the network and does not need to be retried
  * in a loop. A provisioning failure is reported by bluecherry_sync instead, which keeps
  * trying with a growing back-off.
  *
@@ -929,7 +933,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
  * @param bc_device_type The BlueCherry device type string.
  * @param msg_handler The handler used for incoming messages or NULL to ignore them.
  * @param msg_handler_args Optional user pointer which is passed to the message handler.
- * @param auto_sync When set to true, the library will atomatically perform syncs in the background.
+ * @param auto_sync When set to true, the library will automatically perform syncs in the
+ * background.
  * @param watchdog_timeout_seconds The timeout in seconds for the task watchdog. If not 0, your
  * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
  * Should be more than 30 seconds
@@ -946,7 +951,7 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  *
  * This is the only function that uses the network. In order, it provisions the device when it
  * has no credentials yet, opens the connection when there is none, sends one enqueued message,
- * and dispatches whatever came back — incoming messages to the message handler and firmware
+ * and dispatches whatever came back - incoming messages to the message handler and firmware
  * updates to the OTA machinery.
  *
  * It works the same whether the application calls it itself or the automatic synchronisation
@@ -955,7 +960,7 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  * connected.
  *
  * @param blocking When true, the function will block until a message is sent or received, or the
- *                  BLUECHERRY_AUTO_SYNC_SECONDS timeout expires.
+ *                  CONFIG_BLUECHERRY_AUTO_SYNC_SEC timeout expires.
  *
  * @return ESP_OK when finished, BLUECHERRY_SYNC_CONTINUE when more messages are pending,
  * ESP_ERR_NOT_FINISHED while still provisioning or connecting.
@@ -983,7 +988,7 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data);
  * one is offered and reboots as soon as it is installed, so an application that
  * never calls this still receives updates.
  *
- * The two decisions are independently deferrable — see
+ * The two decisions are independently deferrable - see
  * bluecherry_ota_handler_t. The handler runs on the bc_sync task and must not
  * block.
  *
@@ -999,9 +1004,16 @@ esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* arg
  *
  * Only needed by a handler that returned true from
  * BLUECHERRY_OTA_EVENT_AVAILABLE, which is what stops the library starting the
- * download itself. Call it from that handler or long afterwards — the offer does
- * not expire, so an application is free to wait for a quiet moment. If the cloud
- * has withdrawn the update in the meantime the request simply goes unanswered.
+ * download itself. Call it from that handler or long afterwards - there is no
+ * deadline, so an application is free to wait for a quiet moment.
+ *
+ * Act on the offer you were told about most recently. Whenever the library
+ * reconnects to BlueCherry, the update is offered again and
+ * BLUECHERRY_OTA_EVENT_AVAILABLE is raised a second time; in the gap around
+ * that reconnect this returns ESP_ERR_INVALID_STATE, so an application that
+ * defers should react to the newest event rather than assume the first one is
+ * still good. If the cloud has withdrawn the update the request simply goes
+ * unanswered.
  *
  * @return ESP_OK when the request was queued, ESP_ERR_INVALID_STATE when no
  * update is currently on offer.
@@ -1017,7 +1029,8 @@ esp_err_t bluecherry_ota_start(void);
  * @param error_code A bluecherry_ota_error_t. Use
  * BLUECHERRY_OTA_ERR_APP_ABORTED when the application is the one giving up.
  *
- * @return ESP_OK when the report was queued.
+ * @return ESP_OK when the report was queued, ESP_ERR_INVALID_STATE when no
+ * update is in progress.
  */
 esp_err_t bluecherry_ota_abort(uint8_t error_code);
 
