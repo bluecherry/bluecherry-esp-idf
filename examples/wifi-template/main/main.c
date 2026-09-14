@@ -40,16 +40,16 @@
 /**
  * @brief The BlueCherry device type for this application. Required for ZTP.
  *
- * Replace this with the device type issued to you on the BlueCherry platform. It is eight
- * characters and forms the first half of this device's identity, so provisioning fails if it
- * does not name a type that exists in your account.
+ * Replace this with the device type issued to your organization on the BlueCherry platform. It is
+ * eight characters and forms the first half of this device's identity, so provisioning fails if it
+ * does not name a type that exists.
  */
 #define BLUECHERRY_DEVICE_TYPE "walter01"
 
 /**
- * @brief The logging tag for this BlueCherry module.
+ * @brief The logging tag for this application.
  */
-static const char* TAG = "BlueCherry";
+static const char* TAG = "EXAMPLE";
 
 /**
  * @brief The network interface used to connect to the WiFi.
@@ -444,7 +444,7 @@ static const char* bluecherry_ztp_bio_handler(bool read, bool secure, void* args
     esp_err_t err =
         nvs_read_str(keyname, secure ? devkey : devcert, secure ? sizeof(devkey) : sizeof(devcert));
     if(err != ESP_OK) {
-      ESP_LOGW(TAG, "No %s found in NVS (err=0x%x)", keyname, err);
+      ESP_LOGD(TAG, "No %s found in NVS (err=0x%x)", keyname, err);
       return NULL;
     }
     return secure ? devkey : devcert;

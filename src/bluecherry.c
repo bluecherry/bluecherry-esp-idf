@@ -105,6 +105,14 @@ VYg4UI2D74WfVxn+NyVd2/aXTvSBp8VgyV3odA==\r\n\
 static bool _watchdog = false;
 
 /**
+ * @brief When the next provisioning attempt is due, or 0 for "due now".
+ *
+ * At file scope rather than local to bluecherry_sync because the sync task reads it to decide
+ * how long it can sleep: polling a deadline minutes away every 10 ms is pure waste.
+ */
+static int64_t _next_provision_us = 0;
+
+/**
  * @brief Tickle the task watchdog if enabled.
  *
  * This function tickles the task watchdog if it is enabled.
@@ -114,6 +122,33 @@ static void _bluecherry_tickle_watchdog(void)
   if(_watchdog) {
     esp_task_wdt_reset();
   }
+}
+
+/**
+ * @brief How long the synchronisation task may sleep before calling bluecherry_sync again.
+ *
+ * Normally the short poll interval. While provisioning is backing off there is nothing to do
+ * until the deadline, so the task sleeps towards it instead of waking 100 times a second to
+ * compare two timestamps.
+ *
+ * Capped at BLUECHERRY_SYNC_IDLE_MAX_MS so the watchdog, which is fed once per loop
+ * iteration, cannot be starved by a backoff that has grown to a minute.
+ *
+ * @return The number of milliseconds to sleep.
+ */
+static uint32_t _bluecherry_sync_idle_ms(void)
+{
+  if(_bluecherry_opdata.state != BLUECHERRY_STATE_NOT_PROVISIONED || _next_provision_us == 0) {
+    return BLUECHERRY_SYNC_POLL_MS;
+  }
+
+  int64_t remaining_us = _next_provision_us - esp_timer_get_time();
+  if(remaining_us < (int64_t) BLUECHERRY_SYNC_POLL_MS * 1000) {
+    return BLUECHERRY_SYNC_POLL_MS;
+  }
+
+  uint32_t remaining_ms = (uint32_t) (remaining_us / 1000);
+  return remaining_ms > BLUECHERRY_SYNC_IDLE_MAX_MS ? BLUECHERRY_SYNC_IDLE_MAX_MS : remaining_ms;
 }
 
 /**
@@ -133,7 +168,7 @@ static void _bluecherry_sync_task(void* args)
 
   while(true) {
     _bluecherry_tickle_watchdog();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(_bluecherry_sync_idle_ms()));
     if(bluecherry_sync(block) == BLUECHERRY_SYNC_CONTINUE) {
       block = false;
     } else {
@@ -1466,6 +1501,13 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
 
   double timeout = 2.0 * (1 + (rand() / (RAND_MAX + 1.0)) * (1.5 - 1));
 
+  /* Receive into the session buffer instead of a second kilobyte of stack. Provisioning only
+   * runs from BLUECHERRY_STATE_NOT_PROVISIONED, before any CoAP session exists, so in_buf is
+   * idle and no other path can be reading it. in_buf_len is left alone: the receive path sets
+   * it from the read that fills the buffer, so it never describes what is written here. */
+  uint8_t* rx_scratch = _bluecherry_opdata.in_buf;
+  const size_t rx_scratch_cap = sizeof(_bluecherry_opdata.in_buf);
+
   for(uint8_t attempt = 1; attempt <= 4; ++attempt) {
     last_tx_time = time(NULL);
     _bluecherry_tickle_watchdog();
@@ -1474,8 +1516,7 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
       return false;
 
     while(true) {
-      uint8_t temp_buf[1024];
-      int ret = _bluecherry_mbed_dtls_read(temp_buf, sizeof(temp_buf));
+      int ret = _bluecherry_mbed_dtls_read(rx_scratch, rx_scratch_cap);
 
       if(ret > 0) {
         if(ret > BLUECHERRY_ZTP_RSP_HEADER_LEN) {
@@ -1485,7 +1526,7 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
                      (unsigned) payload_len, (unsigned) rx_cap);
             return false;
           }
-          memcpy(rx_buf, temp_buf + BLUECHERRY_ZTP_RSP_HEADER_LEN, payload_len);
+          memcpy(rx_buf, rx_scratch + BLUECHERRY_ZTP_RSP_HEADER_LEN, payload_len);
           *rx_len = (uint16_t) payload_len;
         } else {
           *rx_len = 0;
@@ -2002,7 +2043,7 @@ static bool _ztp_request_device_id()
 
   ret = _ztp_cbor_decode_device_id(in_buf, in_len, ztp_bc_dev_id, sizeof(ztp_bc_dev_id));
   if(ret < 0) {
-    ESP_LOGE(TAG, "Failed to decode device id: %d", ret);
+    ESP_LOGD(TAG, "Failed to decode device id: %d", ret);
     return false;
   }
 
@@ -2162,7 +2203,7 @@ static bool _bluecherry_provision(void)
   if(device_cert == NULL || device_key == NULL) {
     uint8_t mac[8] = { 0 };
 
-    ESP_LOGW(TAG, "Device is not provisioned for BlueCherry communication, starting ZTP...");
+    ESP_LOGI(TAG, "Device is not provisioned for BlueCherry communication, starting ZTP...");
 
     if(esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
       ESP_LOGE(TAG, "(ZTP) Could not read the MAC address to identify this device");
@@ -2176,7 +2217,7 @@ static bool _bluecherry_provision(void)
       goto fail;
     }
 
-    ESP_LOGI(TAG, "Connected to ZTP server");
+    ESP_LOGI(TAG, "(ZTP) Connected");
 
     if(!_ztp_add_device_id_parameter_blob(BLUECHERRY_ZTP_DEVICE_ID_TYPE_MAC, mac)) {
       ESP_LOGE(TAG, "(ZTP) Could not add MAC address as ZTP device ID parameter");
@@ -2184,7 +2225,9 @@ static bool _bluecherry_provision(void)
     }
 
     if(!_ztp_request_device_id()) {
-      ESP_LOGE(TAG, "(ZTP) Could not request device ID");
+      ESP_LOGD(TAG, "(ZTP) Could not request device ID");
+      ESP_LOGE(TAG, "(ZTP) This device might not exist- or is not set to WAIT-PROVISION on the "
+                    "BlueCherry platform.");
       goto fail;
     }
 
@@ -2222,6 +2265,8 @@ static bool _bluecherry_provision(void)
   return true;
 
 fail:
+  /* The specific reason is logged where it was detected; the caller reports the failure
+   * itself, so that the message can name the retry delay it is about to apply. */
   _bluecherry_cleanup_session();
   _bluecherry_opdata.ztp_dev_id_params.count = 0;
   return false;
@@ -2296,7 +2341,12 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
    * session would be discarded unsent. */
 
   if(auto_sync) {
-    BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync", 4096, NULL, BLUECHERRY_SP, NULL);
+    /* Every network operation runs on this task, so it has to carry the deepest of them:
+     * provisioning, which nests a DTLS handshake, ~2.8 kB of CBOR buffers and an EC key
+     * generation. Before provisioning moved here it ran on the caller's task, where the
+     * application had already sized the stack for it. */
+    BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync",
+                                 CONFIG_BLUECHERRY_SYNC_TASK_STACK_SIZE, NULL, BLUECHERRY_SP, NULL);
     if(ret != pdPASS) {
       ESP_LOGE(TAG, "Could not start the synchronisation task");
       goto fail;
@@ -2375,25 +2425,36 @@ esp_err_t bluecherry_sync(bool blocking)
 {
   static int64_t last_retry_time_us = 0;
   static uint32_t retry_interval_ms = 100;
-  static int64_t last_provision_time_us = 0;
-  static uint32_t provision_interval_ms = 100;
+  static uint32_t provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MS;
 
   /* Obtain credentials before anything else. This is backoff-gated on its own timer rather
    * than sharing the connect one, so a provisioning service that is down does not also
-   * throttle the reconnects of a device that is already provisioned. */
+   * throttle the reconnects of a device that is already provisioned.
+   *
+   * A deadline rather than an elapsed-time comparison, so that _next_provision_us == 0 means
+   * "due now" and the first attempt after boot is not itself delayed by the backoff.
+   *
+   * At most one attempt per call, and the gate returns immediately when the next one is not
+   * yet due: the application may be driving bluecherry_sync itself, so this must never block
+   * waiting for a retry to come round. */
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
-    int64_t now_us = esp_timer_get_time();
-    if(((now_us - last_provision_time_us) / 1000) < provision_interval_ms) {
+    if(esp_timer_get_time() < _next_provision_us) {
       return ESP_ERR_NOT_FINISHED;
     }
-    last_provision_time_us = now_us;
 
     if(!_bluecherry_provision()) {
-      provision_interval_ms = (provision_interval_ms < 30000) ? provision_interval_ms * 2 : 30000;
+      ESP_LOGE(TAG, "(ZTP) Provisioning failed, retrying in %lu s", provision_interval_ms / 1000);
+      _next_provision_us = esp_timer_get_time() + (int64_t) provision_interval_ms * 1000;
+
+      provision_interval_ms *= 2;
+      if(provision_interval_ms > BLUECHERRY_PROVISION_RETRY_MAX_MS) {
+        provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MAX_MS;
+      }
       return ESP_ERR_NOT_FINISHED;
     }
 
-    provision_interval_ms = 100;
+    _next_provision_us = 0;
+    provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MS;
     _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
   }
 

@@ -584,6 +584,35 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.5;
  */
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
 
+/**
+ * @brief The initial delay between provisioning attempts.
+ */
+#define BLUECHERRY_PROVISION_RETRY_MS 8000
+
+/**
+ * @brief The ceiling for the delay between provisioning attempts.
+ *
+ * The delay runs 8s, 16s, 32s, 64s and is then held there. Every attempt is a full DTLS
+ * handshake against the provisioning service, so an unprovisioned device retrying faster than
+ * this only loads that service - and unlike a dropped CoAP message there is nothing to gain
+ * from reacting quickly. A device provisions once in its life; a minute is nothing.
+ */
+#define BLUECHERRY_PROVISION_RETRY_MAX_MS 64000
+
+/**
+ * @brief How long the synchronisation task sleeps between syncs.
+ */
+#define BLUECHERRY_SYNC_POLL_MS 10
+
+/**
+ * @brief The longest the synchronisation task will sleep while a backoff runs down.
+ *
+ * The task feeds the task watchdog once per iteration, so this bounds how long the watchdog
+ * goes unfed while waiting - which is why the sleep is capped well under any usable watchdog
+ * timeout instead of just sleeping until the deadline.
+ */
+#define BLUECHERRY_SYNC_IDLE_MAX_MS 1000
+
 typedef union {
   /**
    * @brief Pointer to the BlueCherry Type ID, as this is always programmed in
