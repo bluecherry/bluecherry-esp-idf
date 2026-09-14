@@ -19,12 +19,15 @@ menu "BLUECHERRY Configuration"
             2.8 kB of buffers in nested frames, then SECP256R1 key generation. 4096 is not
             enough for that and overflows. Lower it only if you never use ZTP.
 
-    config BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES
-        int "Max Pending Outgoing Messages"
-        default 32
-        range 1 1024
+    config BLUECHERRY_PUBLISH_BUFFER_SIZE
+        int "Publish Buffer Size (bytes)"
+        default 4096
+        range 256 262144
         help
-            Configure the maximum number of pending outgoing messages.
-            This setting helps manage memory usage and message flow.
+            Size of the buffer holding messages that are waiting to be published, used only
+            when the application passes no buffer of its own to bluecherry_init. Each queued
+            message costs its payload plus 9 bytes; a message that does not fit in the buffer
+            can never be queued at all. Pass a buffer to bluecherry_init to place this in
+            PSRAM or in memory the application reserved itself.
 
 endmenu
