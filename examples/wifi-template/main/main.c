@@ -24,6 +24,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_chip_info.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_event.h>
 #include <sdkconfig.h>
@@ -382,6 +383,30 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
 }
 
 /**
+ * @brief Report what the BlueCherry connection is doing.
+ *
+ * Must not block. Wait for BLUECHERRY_STATE_IDLE to know it is safe to sleep.
+ *
+ * @param state The state just entered.
+ * @param args A NULL pointer.
+ */
+static void bluecherry_state_handler(bluecherry_state state, void* args)
+{
+  switch(state) {
+  case BLUECHERRY_STATE_AWAIT_CONNECTION:
+    ESP_LOGI(TAG, "BlueCherry connecting...");
+    break;
+
+  case BLUECHERRY_STATE_IDLE:
+    ESP_LOGI(TAG, "BlueCherry synchronized");
+    break;
+
+  default:
+    break;
+  }
+}
+
+/**
  * @brief Write a string to NVS.
  *
  * This function writes a string value to NVS under the specified key.
@@ -484,19 +509,51 @@ void app_main(void)
   /* Optional. This handler takes both OTA decisions itself so the calls are visible; drop it,
    * or return false from those events, and the library downloads an offered update and reboots
    * into it on its own. */
-  bluecherry_ota_set_handler(bluecherry_ota_handler, NULL);
+  bluecherry_set_ota_handler(bluecherry_ota_handler, NULL);
+
+  /* Optional. Poll bluecherry_get_state() instead if you prefer. */
+  bluecherry_set_state_handler(bluecherry_state_handler, NULL);
+
+  /* Messages waiting to be published are kept here. Put it wherever you like and make it as
+   * large as you need - PSRAM below, or pass NULL instead to let the library allocate it. */
+  bluecherry_publish_buffer_t pub = { .buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM),
+                                      .size = 8192 };
 
   /* Initialize bluecherry with pre-provisioned keys */
-  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, true, 30));
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, false, 30,
+  //                                 &pub));
 
   /* Initialize bluecherry with zero-touch provisioning. */
   ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
-                                      bluecherry_msg_handler, NULL, true, 30));
+                                      bluecherry_msg_handler, NULL, false, 30,
+                                      pub.buffer != NULL ? &pub : NULL));
+
+  /* Publishing schedules a synchronisation on its own; the 10 seconds is how long we go without
+   * one when there is nothing to send. Call this again at any time to change the interval.
+   * Passing 0 turns it off entirely: nothing is then sent or received until bluecherry_sync()
+   * is called. */
+  bluecherry_set_auto_sync(10);
+
+  uint32_t counter = 0;
 
   while(true) {
-    ESP_LOGI(TAG, "Publishing message");
-    bluecherry_publish(0x84, strlen("Test message") + 1, (const uint8_t*) "Test message");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    char payload[40];
+    snprintf(payload, sizeof(payload), "Hello from ESP-IDF! %lu", ++counter);
+
+    ESP_LOGI(TAG, "Publishing %s", payload);
+
+    /* Any bytes will do; the + 1 sends the terminating NUL along with the text. */
+    esp_err_t err = bluecherry_publish(0x84, strlen(payload) + 1, (const uint8_t*) payload);
+    if(err != ESP_OK) {
+      ESP_LOGW(TAG, "Publish rejected, queue full: %s", esp_err_to_name(err));
+    }
+
+    /* Schedules a synchronisation: upload what is queued, download whatever the cloud has.
+     * Redundant here because auto-sync is on, but with it off this is the only thing that
+     * sends the message above. */
+    // bluecherry_sync();
+
+    vTaskDelay(pdMS_TO_TICKS(15000));
     if(esp_task_wdt_status(NULL) == ESP_OK) {
       esp_task_wdt_reset();
     }

@@ -107,10 +107,44 @@ static bool _watchdog = false;
 /**
  * @brief When the next provisioning attempt is due, or 0 for "due now".
  *
- * At file scope rather than local to bluecherry_sync because the sync task reads it to decide
- * how long it can sleep: polling a deadline minutes away every 10 ms is pure waste.
+ * At file scope because the task reads it to decide how long it can wait.
  */
 static int64_t _next_provision_us = 0;
+
+/**
+ * @brief The synchronisation task, or NULL before bluecherry_init.
+ *
+ * Signalled by bluecherry_sync, and what stops a second init spawning a second task.
+ */
+static TaskHandle_t _sync_task = NULL;
+
+/**
+ * @brief Seconds between automatic synchronisations, or 0 when they are off.
+ */
+static uint32_t _auto_sync_interval_sec = 0;
+
+/**
+ * @brief When the last synchronisation cycle ran.
+ *
+ * The interval is measured from here rather than from when it was set, so changing it re-dates
+ * the next synchronisation against the last one instead of restarting the clock.
+ */
+static int64_t _last_sync_us = 0;
+
+/**
+ * @brief When the next automatic synchronisation is due. Unused while the interval is 0.
+ */
+static int64_t _next_auto_sync_us = 0;
+
+/**
+ * @brief Update requests raised by the application, carried out on the sync task.
+ *
+ * The work they ask for writes the priority slot the task transmits out of, so the caller only
+ * raises a flag: that keeps every write to that slot on one thread.
+ */
+static volatile bool _ota_start_req = false;
+static volatile bool _ota_abort_req = false;
+static volatile uint8_t _ota_abort_code = 0;
 
 /**
  * @brief Tickle the task watchdog if enabled.
@@ -125,36 +159,365 @@ static void _bluecherry_tickle_watchdog(void)
 }
 
 /**
- * @brief How long the synchronisation task may sleep before calling bluecherry_sync again.
+ * @brief Move to a new connection state and tell the application, if it asked.
  *
- * Normally the short poll interval. While provisioning is backing off there is nothing to do
- * until the deadline, so the task sleeps towards it instead of waking 100 times a second to
- * compare two timestamps.
+ * The single place the state is written, so the handler cannot miss a transition.
  *
- * Capped at BLUECHERRY_SYNC_IDLE_MAX_MS so the watchdog, which is fed once per loop
- * iteration, cannot be starved by a backoff that has grown to a minute.
- *
- * @return The number of milliseconds to sleep.
+ * @param next The state to enter.
  */
-static uint32_t _bluecherry_sync_idle_ms(void)
+static void _bluecherry_set_state(bluecherry_state next)
 {
-  if(_bluecherry_opdata.state != BLUECHERRY_STATE_NOT_PROVISIONED || _next_provision_us == 0) {
-    return BLUECHERRY_SYNC_POLL_MS;
+  if(_bluecherry_opdata.state == next) {
+    return;
   }
 
-  int64_t remaining_us = _next_provision_us - esp_timer_get_time();
-  if(remaining_us < (int64_t) BLUECHERRY_SYNC_POLL_MS * 1000) {
-    return BLUECHERRY_SYNC_POLL_MS;
-  }
+  _bluecherry_opdata.state = next;
 
-  uint32_t remaining_ms = (uint32_t) (remaining_us / 1000);
-  return remaining_ms > BLUECHERRY_SYNC_IDLE_MAX_MS ? BLUECHERRY_SYNC_IDLE_MAX_MS : remaining_ms;
+  if(_bluecherry_opdata.state_handler != NULL) {
+    _bluecherry_opdata.state_handler(next, _bluecherry_opdata.state_handler_args);
+  }
 }
 
 /**
- * @brief The entrypoint of the automatic BlueCherry synchronisation task.
+ * @brief Release the publish buffer, freeing it only if it was not the application's.
+ */
+static void _bluecherry_ring_deinit(void)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+
+  if(ring->lock != NULL) {
+    vSemaphoreDelete(ring->lock);
+  }
+  if(ring->owned) {
+    free(ring->buf);
+  }
+
+  memset(ring, 0, sizeof(*ring));
+}
+
+/**
+ * @brief Reserve the publish buffer.
  *
- * This function implements the automatic BlueCherry syncronisation.
+ * @param cfg The application's buffer, or NULL to allocate one here.
+ *
+ * @return ESP_OK on success.
+ */
+static esp_err_t _bluecherry_ring_init(const bluecherry_publish_buffer_t* cfg)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+
+  /* Idempotent: an init retried after a failed one would otherwise strand the previous buffer
+   * and its lock. Safe because the synchronisation task does not touch the buffer while the
+   * state is UNINITIALIZED. */
+  _bluecherry_ring_deinit();
+
+  if(cfg != NULL && cfg->buffer != NULL) {
+    if(cfg->size < BLUECHERRY_MIN_PUBLISH_BUFFER) {
+      ESP_LOGE(TAG, "The publish buffer must be at least %uB", BLUECHERRY_MIN_PUBLISH_BUFFER);
+      return ESP_ERR_INVALID_ARG;
+    }
+    ring->buf = cfg->buffer;
+    ring->size = cfg->size;
+    ring->owned = false;
+  } else {
+    ring->size = CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE;
+    ring->buf = malloc(ring->size);
+    if(ring->buf == NULL) {
+      ESP_LOGE(TAG, "Could not allocate the %uB publish buffer", (unsigned) ring->size);
+      return ESP_ERR_NO_MEM;
+    }
+    ring->owned = true;
+  }
+
+  ring->lock = xSemaphoreCreateMutex();
+  if(ring->lock == NULL) {
+    ESP_LOGE(TAG, "Could not create the publish buffer lock");
+    if(ring->owned) {
+      free(ring->buf);
+    }
+    ring->buf = NULL;
+    return ESP_FAIL;
+  }
+
+  ring->head = 0;
+  ring->tail = 0;
+  ring->wrap = ring->size;
+  ring->count = 0;
+
+  if(ring->size < BLUECHERRY_MAX_MESSAGE_LEN + 2U) {
+    ESP_LOGW(TAG, "Publish buffer of %uB limits a message to %uB", (unsigned) ring->size,
+             (unsigned) (ring->size - BLUECHERRY_PUBLISH_RECORD_OVERHEAD));
+  }
+
+  return ESP_OK;
+}
+
+/**
+ * @brief How many messages are waiting to be published.
+ */
+static size_t _bluecherry_ring_count(void)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+
+  if(ring->lock == NULL) {
+    return 0;
+  }
+
+  xSemaphoreTake(ring->lock, portMAX_DELAY);
+  size_t count = ring->count;
+  xSemaphoreGive(ring->lock);
+
+  return count;
+}
+
+/**
+ * @brief Frame one message into the publish buffer.
+ *
+ * @param topic The topic of the message, passed as the topic index.
+ * @param len The length of the topic payload data.
+ * @param data The topic payload data.
+ *
+ * @return ESP_OK on success, ESP_ERR_NO_MEM when the buffer is full.
+ */
+static esp_err_t _bluecherry_ring_push(uint8_t topic, uint16_t len, const uint8_t* data)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+  const size_t rec = BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE + len;
+  const size_t need = 2 + rec;
+
+  if(ring->lock == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if(need > ring->size) {
+    ESP_LOGE(TAG, "The message does not fit in the %uB publish buffer", (unsigned) ring->size);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  xSemaphoreTake(ring->lock, portMAX_DELAY);
+
+  if(ring->count == 0) {
+    /* Nothing is held, so start over and give the message the whole buffer to fit in. */
+    ring->head = 0;
+    ring->tail = 0;
+    ring->wrap = ring->size;
+  }
+
+  size_t room = ring->count == 0          ? ring->size
+                : ring->head > ring->tail ? ring->size - ring->head
+                                          : ring->tail - ring->head;
+  size_t at;
+
+  if(room >= need) {
+    at = ring->head;
+    ring->head += need;
+  } else if(ring->head > ring->tail && ring->tail >= need) {
+    /* Out of room at the end, but the records have moved on far enough to start again in front
+     * of them. wrap is where the reader has to turn around. */
+    ring->wrap = ring->head;
+    at = 0;
+    ring->head = need;
+  } else {
+    xSemaphoreGive(ring->lock);
+    return ESP_ERR_NO_MEM;
+  }
+
+  uint8_t* p = ring->buf + at;
+  p[0] = (uint8_t) (rec & 0xFF);
+  p[1] = (uint8_t) (rec >> 8);
+  p += 2;
+
+  /* The CoAP header is left as it is: it carries the message id, which the transmit path only
+   * knows once it is about to send, and writes into the record then. */
+  p[BLUECHERRY_COAP_HEADER_SIZE] = topic;
+  p[BLUECHERRY_COAP_HEADER_SIZE + 1] = (uint8_t) (len & 0xFF);
+  memcpy(p + BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE, data, len);
+
+  ring->count += 1;
+  xSemaphoreGive(ring->lock);
+
+  return ESP_OK;
+}
+
+/**
+ * @brief Point at the oldest message without removing it.
+ *
+ * The pointer stays valid until _bluecherry_ring_pop, which is what lets the message be
+ * transmitted, and retransmitted, while other tasks keep publishing: a publish only ever writes
+ * from head onwards, which never reaches into the record being sent.
+ *
+ * @param out Filled in with the message.
+ *
+ * @return True when there was one.
+ */
+static bool _bluecherry_ring_peek(_bluecherry_msg_t* out)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+
+  if(ring->lock == NULL) {
+    return false;
+  }
+
+  xSemaphoreTake(ring->lock, portMAX_DELAY);
+
+  bool found = ring->count > 0;
+  if(found) {
+    out->len = (size_t) ring->buf[ring->tail] | ((size_t) ring->buf[ring->tail + 1] << 8);
+    out->data = ring->buf + ring->tail + 2;
+  }
+
+  xSemaphoreGive(ring->lock);
+
+  return found;
+}
+
+/**
+ * @brief Drop the oldest message, which is only correct once the cloud has acknowledged it.
+ */
+static void _bluecherry_ring_pop(void)
+{
+  _bluecherry_ring_t* ring = &_bluecherry_opdata.out_ring;
+
+  if(ring->lock == NULL) {
+    return;
+  }
+
+  xSemaphoreTake(ring->lock, portMAX_DELAY);
+
+  if(ring->count > 0) {
+    size_t len = (size_t) ring->buf[ring->tail] | ((size_t) ring->buf[ring->tail + 1] << 8);
+    ring->tail += 2 + len;
+    ring->count -= 1;
+
+    if(ring->tail >= ring->wrap) {
+      /* The records tile the buffer exactly, so this lands on wrap rather than past it. */
+      ring->tail = 0;
+      ring->wrap = ring->size;
+    }
+    if(ring->count == 0) {
+      ring->head = 0;
+      ring->tail = 0;
+      ring->wrap = ring->size;
+    }
+  }
+
+  xSemaphoreGive(ring->lock);
+}
+
+/**
+ * @brief Whether anything is still outstanding in either direction.
+ *
+ * The publish buffer counts because a cycle sends one message: without it the state would
+ * settle to IDLE with publishes still waiting.
+ *
+ * @param want_resync Whether the server asked for another round.
+ *
+ * @return True while there is more to do.
+ */
+static bool _bluecherry_work_pending(bool want_resync)
+{
+  return want_resync || _bluecherry_opdata.pending_event_len > 0 || _bluecherry_ring_count() > 0;
+}
+
+/**
+ * @brief Settle the state after a cycle that returned before it could do so itself.
+ *
+ * A cycle that reaches the end settles itself. One that returns early leaves AWAITING_RESPONSE
+ * behind, which is the only case this cleans up - testing for exactly that is what stops it
+ * overwriting a PENDING_MESSAGES the server asked for.
+ */
+static void _bluecherry_settle_state(void)
+{
+  if(_bluecherry_opdata.state != BLUECHERRY_STATE_AWAITING_RESPONSE) {
+    return;
+  }
+
+  _bluecherry_set_state(_bluecherry_work_pending(false) ? BLUECHERRY_STATE_PENDING_MESSAGES
+                                                        : BLUECHERRY_STATE_IDLE);
+}
+
+/**
+ * @brief How long the synchronisation task may wait before running the next cycle.
+ *
+ * The next deadline it knows about: a provisioning retry or the auto-sync interval. Capped at
+ * BLUECHERRY_SYNC_IDLE_MAX_MS so the watchdog cannot be starved. A trigger cuts the wait short.
+ *
+ * @return The number of milliseconds to wait.
+ */
+static uint32_t _bluecherry_sync_wait_ms(void)
+{
+  int64_t deadline_us = 0;
+
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
+    deadline_us = _next_provision_us;
+  } else if(_auto_sync_interval_sec > 0) {
+    deadline_us = _next_auto_sync_us;
+  }
+
+  if(deadline_us == 0) {
+    return BLUECHERRY_SYNC_IDLE_MAX_MS;
+  }
+
+  int64_t remaining_us = deadline_us - esp_timer_get_time();
+  if(remaining_us <= 0) {
+    return 0;
+  }
+
+  uint64_t remaining_ms = (uint64_t) remaining_us / 1000;
+  return remaining_ms > BLUECHERRY_SYNC_IDLE_MAX_MS ? BLUECHERRY_SYNC_IDLE_MAX_MS
+                                                    : (uint32_t) remaining_ms;
+}
+
+/**
+ * @brief Whether a cycle is due without anything having asked for one.
+ *
+ * The wait is capped so the watchdog stays fed, so it expiring says nothing about whether
+ * there is work: this is the actual test. Provisioning and connecting are always due, because
+ * their own backoff gates decide whether the cycle does anything.
+ *
+ * @return True when the task should run a cycle of its own accord.
+ */
+static bool _bluecherry_sync_due(void)
+{
+  switch(_bluecherry_opdata.state) {
+  case BLUECHERRY_STATE_UNINITIALIZED:
+    return false;
+
+  case BLUECHERRY_STATE_NOT_PROVISIONED:
+    return esp_timer_get_time() >= _next_provision_us;
+
+  case BLUECHERRY_STATE_AWAIT_CONNECTION:
+    return true;
+
+  default:
+    break;
+  }
+
+  return _auto_sync_interval_sec > 0 && esp_timer_get_time() >= _next_auto_sync_us;
+}
+
+/**
+ * @brief Arm the next automatic synchronisation, or clear it when they are off.
+ *
+ * Counted from the last synchronisation, not from now, so that changing the interval asks
+ * "how long since the last one" rather than restarting the wait. Shortening it below the time
+ * already elapsed therefore leaves the next one due immediately, which is the point.
+ */
+static void _bluecherry_arm_auto_sync(void)
+{
+  _next_auto_sync_us =
+      _auto_sync_interval_sec > 0 ? _last_sync_us + (int64_t) _auto_sync_interval_sec * 1000000 : 0;
+}
+
+/* Defined further down, but the task is the only caller of both. */
+static esp_err_t _bluecherry_sync_once(void);
+static void _bluecherry_ota_service_requests(void);
+
+/**
+ * @brief The entrypoint of the BlueCherry synchronisation task.
+ *
+ * Owns every network operation the library performs, and all the timing around them. It runs a
+ * cycle when something triggers one, when an automatic synchronisation falls due, or when the
+ * previous cycle finished with work still outstanding; otherwise it waits.
  *
  * @param args A NULL pointer.
  */
@@ -164,16 +527,40 @@ static void _bluecherry_sync_task(void* args)
     esp_task_wdt_add(NULL);
   }
 
-  bool block = true;
-
   while(true) {
     _bluecherry_tickle_watchdog();
-    vTaskDelay(pdMS_TO_TICKS(_bluecherry_sync_idle_ms()));
-    if(bluecherry_sync(block) == BLUECHERRY_SYNC_CONTINUE) {
-      block = false;
-    } else {
-      block = true;
+
+    /* Clearing on take is what makes bluecherry_sync a trigger rather than a queue: any number
+     * of calls collapse into one cycle, and one raised mid-cycle is still pending here. */
+    uint32_t triggered = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(_bluecherry_sync_wait_ms()));
+
+    _bluecherry_tickle_watchdog();
+
+    /* The task starts before init finishes, and init can still fail after that. */
+    if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
+      continue;
     }
+
+    /* Waking is not the same as having something to do: the wait is capped for the watchdog,
+     * so it expires long before a deadline that is further out than the cap. */
+    if(triggered == 0 && !_bluecherry_sync_due()) {
+      continue;
+    }
+
+    _bluecherry_ota_service_requests();
+
+    esp_err_t ret = _bluecherry_sync_once();
+    _bluecherry_settle_state();
+
+    /* Recorded at the end of a cycle, so the interval is "time since the last exchange". */
+    _last_sync_us = esp_timer_get_time();
+    _bluecherry_arm_auto_sync();
+
+    /* Self-notify rather than loop, so every cycle takes the same path past the watchdog. */
+    if(ret == BLUECHERRY_SYNC_CONTINUE) {
+      xTaskNotifyGive(_sync_task);
+    }
+
     /* Also fed on the way out, so a long sync is bracketed rather than merely
      * preceded by a reset. Feeding only before the call leaves the effective
      * budget at "the watchdog timeout minus one whole sync". */
@@ -266,7 +653,7 @@ static bool _bluecherry_ota_buffer_to_flash(void)
 /**
  * @brief Queue one internal-channel (topic 0x00) frame in the priority slot.
  *
- * The slot is checked before out_queue in the send step, so a protocol reply
+ * The slot is checked before out_ring in the send step, so a protocol reply
  * goes out on the very next sync instead of queueing behind the application's
  * publishes. That matters most for the probe reply: any topic 0x00 frame sets
  * want_resync, so the sync task loops again in milliseconds and the answer is
@@ -378,6 +765,56 @@ static void _bluecherry_ota_fail(uint8_t error_code)
 
   _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_FAILED, error_code);
   _bluecherry_ota_reset();
+}
+
+/**
+ * @brief Accept the offered update and ask the server to start sending it.
+ *
+ * The body of bluecherry_ota_start, moved here so it runs on the synchronisation task: it
+ * writes the priority slot that the task transmits out of, and a second writer there can splice
+ * a frame that is mid-flight across its retransmits.
+ */
+static void _bluecherry_ota_begin(void)
+{
+  /* The authoritative check: the offer can be withdrawn between the request and this running. */
+  if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
+    ESP_LOGW(TAG, "OTA: the offer was withdrawn before the update could start");
+    return;
+  }
+
+  uint8_t payload[2] = { BLUECHERRY_EVENT_TYPE_OTA_START,
+                         (uint8_t) _bluecherry_opdata.ota_target_version };
+  if(_bluecherry_publish_event(payload, sizeof(payload)) != ESP_OK) {
+    return;
+  }
+
+  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_DOWNLOADING;
+  _bluecherry_opdata.ota_progress = 0;
+  _bluecherry_opdata.ota_buffer_pos = 0;
+
+  ESP_LOGI(TAG, "OTA: requesting firmware v%d (%lu bytes)", _bluecherry_opdata.ota_target_version,
+           _bluecherry_opdata.ota_size);
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_STARTED, 0);
+}
+
+/**
+ * @brief Carry out whatever bluecherry_ota_start or bluecherry_ota_abort asked for.
+ *
+ * Run before the send step, so the resulting event goes out in the same cycle.
+ */
+static void _bluecherry_ota_service_requests(void)
+{
+  if(_ota_start_req) {
+    _ota_start_req = false;
+    _bluecherry_ota_begin();
+  }
+
+  if(_ota_abort_req) {
+    _ota_abort_req = false;
+    if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_IDLE) {
+      _bluecherry_ota_fail(_ota_abort_code);
+    }
+  }
 }
 
 /**
@@ -1390,7 +1827,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
       return ESP_FAIL;
     }
 
-    _bluecherry_opdata.state = BLUECHERRY_STATE_AWAITING_RESPONSE;
+    _bluecherry_set_state(BLUECHERRY_STATE_AWAITING_RESPONSE);
 
     while(true) {
       int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
@@ -1423,12 +1860,8 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
         }
 
         _bluecherry_opdata.cur_message_id = tx_message_id;
-        /* Settle the state before returning. AWAITING_RESPONSE is rejected on entry to
-         * bluecherry_sync, and one caller path returns without assigning a state of its own,
-         * so leaving it set here would reject every later sync for the lifetime of the
-         * process. The caller overwrites this with IDLE or PENDING_MESSAGES once it has
-         * walked the response. */
-        _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
+        /* Left at AWAITING_RESPONSE: the response has not been walked, so IDLE would tell an
+         * application waiting to sleep that nothing is outstanding before CONTINUE was read. */
         return ESP_OK;
       } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
         return ESP_FAIL;
@@ -1442,8 +1875,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
     timeout *= 2;
   }
 
-  /* Settle the state here too; the caller moves it to AWAIT_CONNECTION. */
-  _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
+  /* Left at AWAITING_RESPONSE for the same reason; the caller moves it to AWAIT_CONNECTION. */
   return ESP_ERR_TIMEOUT;
 }
 
@@ -2275,7 +2707,7 @@ fail:
 /**
  * @brief Reserve everything both entry points need, without touching the network.
  *
- * Allocates the outgoing queue, sets up the Mbed TLS contexts and the CA chain, configures the
+ * Reserves the publish buffer, sets up the Mbed TLS contexts and the CA chain, configures the
  * watchdog and starts the synchronisation task. The caller supplies the state to settle in,
  * which is the only thing that differs between a pre-provisioned device and one that still has
  * to be provisioned.
@@ -2284,6 +2716,7 @@ fail:
  * @param msg_handler_args Optional user arguments to pass to the message handler.
  * @param auto_sync True to spawn the automatic synchronisation task.
  * @param watchdog_timeout_seconds The task watchdog timeout in seconds, or 0 to leave it alone.
+ * @param publish_buffer The application's publish buffer, or NULL to allocate one.
  * @param initial_state The state to leave the library in on success.
  *
  * @return ESP_OK on success, ESP_FAIL otherwise.
@@ -2291,6 +2724,7 @@ fail:
 static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
                                          void* msg_handler_args, bool auto_sync,
                                          uint16_t watchdog_timeout_seconds,
+                                         const bluecherry_publish_buffer_t* publish_buffer,
                                          bluecherry_state initial_state)
 {
   _bluecherry_opdata.msg_handler = msg_handler;
@@ -2303,11 +2737,9 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
     return ESP_FAIL;
   }
 
-  _bluecherry_opdata.out_queue =
-      xQueueCreate(CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES, sizeof(_bluecherry_msg_t));
-  if(_bluecherry_opdata.out_queue == NULL) {
-    ESP_LOGE(TAG, "Unable to create outgoing message queue");
-    return ESP_FAIL;
+  esp_err_t bret = _bluecherry_ring_init(publish_buffer);
+  if(bret != ESP_OK) {
+    return bret;
   }
 
   if(!_bluecherry_setup_mbedtls(mac)) {
@@ -2340,29 +2772,37 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
    * every connect and refills it with a fresh INIT_INFO, so anything queued before the first
    * session would be discarded unsent. */
 
-  if(auto_sync) {
-    /* Every network operation runs on this task, so it has to carry the deepest of them:
-     * provisioning, which nests a DTLS handshake, ~2.8 kB of CBOR buffers and an EC key
-     * generation. Before provisioning moved here it ran on the caller's task, where the
-     * application had already sized the stack for it. */
-    BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync",
-                                 CONFIG_BLUECHERRY_SYNC_TASK_STACK_SIZE, NULL, BLUECHERRY_SP, NULL);
+  /* Started unconditionally: bluecherry_sync is a trigger, so the task has to exist even when
+   * the application drives synchronisation itself. Guarded on the handle so a retried init
+   * cannot leave two running. The stack has to carry the deepest operation, which is
+   * provisioning: a DTLS handshake, ~2.8 kB of CBOR buffers and an EC key generation. */
+  if(_sync_task == NULL) {
+    BaseType_t ret =
+        xTaskCreate(_bluecherry_sync_task, "bc_sync", CONFIG_BLUECHERRY_SYNC_TASK_STACK_SIZE, NULL,
+                    BLUECHERRY_SP, &_sync_task);
     if(ret != pdPASS) {
+      _sync_task = NULL;
       ESP_LOGE(TAG, "Could not start the synchronisation task");
       goto fail;
     }
   }
 
-  _bluecherry_opdata.state = initial_state;
+  if(auto_sync) {
+    ESP_LOGW(TAG, "the auto_sync argument is deprecated, "
+                  "call bluecherry_set_auto_sync(seconds) instead");
+    bluecherry_set_auto_sync(CONFIG_BLUECHERRY_AUTO_SYNC_SEC);
+  }
+
+  _bluecherry_set_state(initial_state);
+
+  /* There is always something to do here, so start the first cycle rather than wait it out. */
+  xTaskNotifyGive(_sync_task);
   return ESP_OK;
 
 fail:
-  /* The queue is freed here too. It used to survive these paths, so a caller that retried
-   * init leaked one queue per attempt. */
-  if(_bluecherry_opdata.out_queue != NULL) {
-    vQueueDelete(_bluecherry_opdata.out_queue);
-    _bluecherry_opdata.out_queue = NULL;
-  }
+  /* The publish buffer is released here too. It used to survive these paths, so a caller that
+   * retried init leaked one buffer per attempt. */
+  _bluecherry_ring_deinit();
   _bluecherry_cleanup_network();
   _bluecherry_cleanup_mbedtls();
   return ESP_FAIL;
@@ -2370,7 +2810,8 @@ fail:
 
 esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
                           bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                          bool auto_sync, uint16_t watchdog_timeout_seconds)
+                          bool auto_sync, uint16_t watchdog_timeout_seconds,
+                          const bluecherry_publish_buffer_t* publish_buffer)
 {
   if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED)
     return ESP_OK;
@@ -2382,14 +2823,14 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
 
   esp_err_t ret =
       _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
-                              BLUECHERRY_STATE_AWAIT_CONNECTION);
+                              publish_buffer, BLUECHERRY_STATE_AWAIT_CONNECTION);
   if(ret != ESP_OK) {
     return ret;
   }
 
   if(!_bluecherry_configure_own_cert(device_cert, device_key)) {
     ESP_LOGE(TAG, "Could not configure device credentials");
-    _bluecherry_opdata.state = BLUECHERRY_STATE_UNINITIALIZED;
+    _bluecherry_set_state(BLUECHERRY_STATE_UNINITIALIZED);
     return ESP_FAIL;
   }
 
@@ -2399,7 +2840,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
                               void* ztp_bio_handler_args, const char* bc_device_type,
                               bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                              bool auto_sync, uint16_t watchdog_timeout_seconds)
+                              bool auto_sync, uint16_t watchdog_timeout_seconds,
+                              const bluecherry_publish_buffer_t* publish_buffer)
 {
   if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED) {
     return ESP_OK;
@@ -2418,10 +2860,19 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
    * provisioning this device both happen on the first bluecherry_sync - so this call cannot
    * fail because the cloud is unreachable, and the caller does not have to retry it. */
   return _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
-                                 BLUECHERRY_STATE_NOT_PROVISIONED);
+                                 publish_buffer, BLUECHERRY_STATE_NOT_PROVISIONED);
 }
 
-esp_err_t bluecherry_sync(bool blocking)
+/**
+ * @brief Run one synchronisation cycle: provision, connect, send one message, dispatch the reply.
+ *
+ * Runs only on the synchronisation task, one at a time, which is what lets it touch the shared
+ * connection state without locking. Timing is the caller's concern, not its own.
+ *
+ * @return BLUECHERRY_SYNC_CONTINUE when work is still outstanding and another cycle should
+ * follow immediately, ESP_OK when everything settled, or an error for the round that failed.
+ */
+static esp_err_t _bluecherry_sync_once(void)
 {
   static int64_t last_retry_time_us = 0;
   static uint32_t retry_interval_ms = 100;
@@ -2455,7 +2906,7 @@ esp_err_t bluecherry_sync(bool blocking)
 
     _next_provision_us = 0;
     provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MS;
-    _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+    _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
   }
 
   // (re)connect if needed with exponential backoff (non-blocking)
@@ -2482,7 +2933,8 @@ esp_err_t bluecherry_sync(bool blocking)
       _bluecherry_ota_reset();
       _bluecherry_opdata.pending_event_len = 0;
 
-      _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
+      /* Not IDLE: the INIT_INFO queued just below still has to go out. */
+      _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
       retry_interval_ms = 100;
 
       /* Report the running image on every connect, not only at boot. */
@@ -2492,28 +2944,26 @@ esp_err_t bluecherry_sync(bool blocking)
     }
   }
 
-  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED ||
-     _bluecherry_opdata.state == BLUECHERRY_STATE_AWAITING_RESPONSE) {
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
     ESP_LOGE(TAG, "Cannot sync in the current state");
     return ESP_ERR_INVALID_STATE;
   }
 
-  const int64_t now = time(NULL);
-  const TickType_t wait_ticks = pdMS_TO_TICKS(200);
-  int blocktime = blocking ? wait_ticks : 0;
+  /* AWAITING_RESPONSE is no longer rejected here: only the task calls this, serially, so it
+   * cannot be observed on entry except as a leftover from a cycle that got no response. */
+
   _bluecherry_msg_t out_msg;
 
   // Internal-channel protocol replies jump the application queue. Only one
-  // message goes out per sync, so a probe reply left to queue behind up to
-  // CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES publishes would be that
-  // many syncs away - long enough for the server to push a whole image in a
-  // form this client cannot accept.
+  // message goes out per sync, so a probe reply left to queue behind a full
+  // publish buffer would be that many syncs away - long enough for the server
+  // to push a whole image in a form this client cannot accept.
   if(_bluecherry_opdata.pending_event_len > 0) {
     _bluecherry_msg_t ev = { .len = _bluecherry_opdata.pending_event_len,
                              .data = _bluecherry_opdata.pending_event };
     if(_bluecherry_coap_rxtx(&ev) != ESP_OK) {
       ESP_LOGE(TAG, "Could not sync internal event with cloud");
-      _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+      _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
       return ESP_ERR_NOT_FINISHED;
     }
     _bluecherry_opdata.pending_event_len = 0;
@@ -2525,33 +2975,23 @@ esp_err_t bluecherry_sync(bool blocking)
       _bluecherry_ota_commit();
     }
   }
-  // Peeked, not received: the message stays queued until its ACK is in, so a
-  // failed sync retries it rather than dropping it.
-  else if(xQueuePeek(_bluecherry_opdata.out_queue, &out_msg, blocktime) == pdPASS) {
+  // Peeked, not popped: the message stays in the buffer until its ACK is in, so
+  // a failed sync retries it rather than dropping it.
+  else if(_bluecherry_ring_peek(&out_msg)) {
     if(_bluecherry_coap_rxtx(&out_msg) == ESP_OK) {
-      if(xQueueReceive(_bluecherry_opdata.out_queue, &out_msg, 0) == pdPASS) {
-        free(out_msg.data);
-      } else {
-        ESP_LOGE(TAG, "Could not remove transmitted message from queue");
-        return ESP_FAIL;
-      }
+      _bluecherry_ring_pop();
     } else {
       ESP_LOGE(TAG, "Could not sync payload with cloud");
-      _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
+      _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
       return ESP_ERR_NOT_FINISHED;
     }
   } else {
-    // Nothing to send. An empty sync still has to go out periodically: it is
-    // the only thing that lets the server deliver downlink to a device that
-    // never publishes.
-    if(!blocking || ((now - _bluecherry_opdata.last_tx_time) >= CONFIG_BLUECHERRY_AUTO_SYNC_SEC)) {
-      if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "Could not sync with cloud");
-        _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
-        return ESP_ERR_NOT_FINISHED;
-      }
-    } else {
-      return ESP_OK;
+    // Nothing to send, but an empty sync is still the only thing that lets the server deliver
+    // downlink to a device that never publishes. Whether one is due is the task's decision.
+    if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
+      ESP_LOGE(TAG, "Could not sync with cloud");
+      _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
+      return ESP_ERR_NOT_FINISHED;
     }
   }
 
@@ -2644,14 +3084,16 @@ esp_err_t bluecherry_sync(bool blocking)
     offset += data_len;
   }
 
-  if(want_resync) {
-    ESP_LOGD(TAG, "Synchronized messages with cloud");
-    _bluecherry_opdata.state = BLUECHERRY_STATE_PENDING_MESSAGES;
+  ESP_LOGD(TAG, "Synchronized messages with cloud");
+
+  /* An application is entitled to sleep on IDLE, so the server having more queued is only one
+   * way this can be unsettled - the outgoing queue and a just-queued reply count too. */
+  if(_bluecherry_work_pending(want_resync)) {
+    _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
     return BLUECHERRY_SYNC_CONTINUE;
   }
 
-  ESP_LOGD(TAG, "Synchronized messages with cloud");
-  _bluecherry_opdata.state = BLUECHERRY_STATE_IDLE;
+  _bluecherry_set_state(BLUECHERRY_STATE_IDLE);
   return ESP_OK;
 }
 
@@ -2664,29 +3106,22 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
     return ESP_ERR_INVALID_SIZE;
   }
 
-  size_t total_len = BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE + len;
-
-  uint8_t* data_cpy = malloc(total_len);
-  if(data_cpy == NULL) {
-    ESP_LOGE(TAG, "Could not allocate publish buffer: %s", strerror(errno));
-    return ESP_ERR_NO_MEM;
+  esp_err_t ret = _bluecherry_ring_push(topic, len, data);
+  if(ret != ESP_OK) {
+    return ret;
   }
 
-  (data_cpy + BLUECHERRY_COAP_HEADER_SIZE)[0] = topic;
-  (data_cpy + BLUECHERRY_COAP_HEADER_SIZE)[1] = len & 0xFF;
-  memcpy(data_cpy + BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE, data, len);
-
-  _bluecherry_msg_t msg = { .len = total_len, .data = data_cpy };
-
-  if(xQueueSendToBack(_bluecherry_opdata.out_queue, &msg, 0) != pdTRUE) {
-    free(data_cpy);
-    return ESP_ERR_NO_MEM;
+  /* Something to send is reason enough to run: the interval exists to force an empty sync when
+   * there is nothing queued, not to hold queued messages back. With auto-sync off there is no
+   * timer at all, so the message waits for the application to call bluecherry_sync. */
+  if(_auto_sync_interval_sec > 0 && _sync_task != NULL) {
+    xTaskNotifyGive(_sync_task);
   }
 
   return ESP_OK;
 }
 
-esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* args)
+esp_err_t bluecherry_set_ota_handler(bluecherry_ota_handler_t handler, void* args)
 {
   _bluecherry_opdata.ota_handler = handler;
   _bluecherry_opdata.ota_handler_args = args;
@@ -2695,26 +3130,16 @@ esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* arg
 
 esp_err_t bluecherry_ota_start(void)
 {
+  /* Advisory: the application may be on any task, and the offer could be withdrawn between this
+   * check and the request being serviced. The task re-checks before acting. Answering here
+   * anyway keeps the return value meaning what it always did. */
   if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
     ESP_LOGW(TAG, "bluecherry_ota_start: no update is on offer");
     return ESP_ERR_INVALID_STATE;
   }
 
-  uint8_t payload[2] = { BLUECHERRY_EVENT_TYPE_OTA_START,
-                         (uint8_t) _bluecherry_opdata.ota_target_version };
-  esp_err_t err = _bluecherry_publish_event(payload, sizeof(payload));
-  if(err != ESP_OK) {
-    return err;
-  }
-
-  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_DOWNLOADING;
-  _bluecherry_opdata.ota_progress = 0;
-  _bluecherry_opdata.ota_buffer_pos = 0;
-
-  ESP_LOGI(TAG, "OTA: requesting firmware v%d (%lu bytes)", _bluecherry_opdata.ota_target_version,
-           _bluecherry_opdata.ota_size);
-  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_STARTED, 0);
-  return ESP_OK;
+  _ota_start_req = true;
+  return bluecherry_sync();
 }
 
 esp_err_t bluecherry_ota_abort(uint8_t error_code)
@@ -2722,7 +3147,55 @@ esp_err_t bluecherry_ota_abort(uint8_t error_code)
   if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_IDLE) {
     return ESP_ERR_INVALID_STATE;
   }
-  _bluecherry_ota_fail(error_code);
+
+  _ota_abort_code = error_code;
+  _ota_abort_req = true;
+  return bluecherry_sync();
+}
+
+esp_err_t bluecherry_sync(void)
+{
+  if(_sync_task == NULL || _bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  xTaskNotifyGive(_sync_task);
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_set_auto_sync(uint32_t interval_sec)
+{
+  if(_sync_task == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  _auto_sync_interval_sec = interval_sec;
+  _bluecherry_arm_auto_sync();
+
+  if(interval_sec > 0) {
+    /* Only when the new interval leaves one already overdue. Setting a schedule is not the
+     * same as asking for a synchronisation, and anything still in the future is picked up by
+     * the task's next wake anyway. */
+    if(esp_timer_get_time() >= _next_auto_sync_us) {
+      xTaskNotifyGive(_sync_task);
+    }
+    ESP_LOGI(TAG, "Automatic synchronisation every %lu s", interval_sec);
+  } else {
+    ESP_LOGI(TAG, "Automatic synchronisation disabled");
+  }
+
+  return ESP_OK;
+}
+
+bluecherry_state bluecherry_get_state(void)
+{
+  return _bluecherry_opdata.state;
+}
+
+esp_err_t bluecherry_set_state_handler(bluecherry_state_handler_t handler, void* args)
+{
+  _bluecherry_opdata.state_handler_args = args;
+  _bluecherry_opdata.state_handler = handler;
   return ESP_OK;
 }
 

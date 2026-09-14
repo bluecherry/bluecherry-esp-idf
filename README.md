@@ -60,10 +60,11 @@ void msg_handler(uint8_t topic, uint16_t len, const uint8_t *data, void *args)
   ESP_LOGI(TAG, "Received MQTT message of length %d on topic %02X: %.*s", len, topic, len, data);
 }
 
-/* The last argument is the task watchdog timeout in seconds, 0 to leave it alone.
+/* 60 is the task watchdog timeout in seconds, 0 to leave it alone. The last argument is where
+ * messages waiting to be published are kept - NULL for a buffer allocated here.
  * This call reserves buffers and starts the background sync task; it does not touch the
  * network, so it does not need to be retried when the cloud is unreachable. */
-bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60);
+bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60, NULL);
 
 while(true) {
   bluecherry_publish(0x84, strlen("Hello World") + 1, (const uint8_t*) "Hello World");
@@ -71,9 +72,22 @@ while(true) {
 } 
 ```
 
-Messages are queued, not sent: `bluecherry_publish` hands the payload to the outgoing queue and
-returns. `bluecherry_sync` is what talks to the cloud — the background task above calls it for
+Messages are queued, not sent: `bluecherry_publish` copies the payload into the publish buffer and
+returns. `bluecherry_sync` is what talks to the cloud - the background task above calls it for
 you, or you can set `auto_sync` to false and call it yourself.
+
+Nothing is dropped to make room: a message stays in the buffer until the cloud acknowledges it, so
+`bluecherry_publish` returns `ESP_ERR_NO_MEM` once the buffer is full and the connection is not
+keeping up. Pass a `bluecherry_publish_buffer_t` to `bluecherry_init` to decide how much room that
+is and where it comes from - PSRAM, say, or memory your application reserved itself:
+
+```c
+bluecherry_publish_buffer_t pub = { .buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM),
+                                    .size = 8192 };
+bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60, &pub);
+```
+
+With `NULL` the library allocates `CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE` bytes itself.
 
 If you would rather not handle certificates at all, `bluecherry_init_ztp` provisions the device
 on first use and stores the issued certificate through a callback you supply.
@@ -99,9 +113,9 @@ be read [here](license.md).
 Firmware updates are handled for you: when the platform offers one, the library downloads it,
 verifies the written image against the hash the cloud published, and reboots into it.
 
-An application that needs a say registers a handler with `bluecherry_ota_set_handler`. It is
+An application that needs a say registers a handler with `bluecherry_set_ota_handler`. It is
 told when an update becomes available, how far along the download is, and when the new image is
-installed. Returning `true` from the handler means "I will decide this one" — which is how you
+installed. Returning `true` from the handler means "I will decide this one" - which is how you
 defer a download to a quiet hour with `bluecherry_ota_start`, or postpone the reboot until it is
 safe. Returning `false`, or registering no handler at all, leaves the library to get on with it.
 `bluecherry_ota_abort` gives up on an update in progress.

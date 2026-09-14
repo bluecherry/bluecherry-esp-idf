@@ -32,6 +32,7 @@
 #include <spi_flash_mmap.h>
 #include <mbedtls/timing.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <mbedtls/error.h>
 #include <esp_partition.h>
 #include <freertos/task.h>
@@ -67,7 +68,11 @@ extern "C" {
 #endif
 
 /**
- * @brief This return code is used by BlueCherry sync to signal if it want's to continue syncing.
+ * @brief Internal: one sync cycle finished with work still outstanding.
+ *
+ * No longer returned by any public function - bluecherry_sync is a trigger and reports only
+ * whether the task was signalled. Kept defined so existing sources that reference it still
+ * compile. Deliberately outside the esp_err_t range.
  */
 #define BLUECHERRY_SYNC_CONTINUE 0x100
 
@@ -75,6 +80,20 @@ extern "C" {
  * @brief The maximum size of a BlueCherry message payload.
  */
 #define BLUECHERRY_MAX_MESSAGE_LEN 1024
+
+/**
+ * @brief The smallest publish buffer bluecherry_init accepts.
+ *
+ * Only a floor against a buffer that could hold almost nothing. A buffer smaller than
+ * BLUECHERRY_MAX_MESSAGE_LEN is allowed, it simply cannot queue the largest messages.
+ */
+#define BLUECHERRY_MIN_PUBLISH_BUFFER 256
+
+/**
+ * @brief Bytes of framing a queued message costs on top of its payload.
+ */
+#define BLUECHERRY_PUBLISH_RECORD_OVERHEAD                                                         \
+  (2U + BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE)
 
 /**
  * @brief The timeout in seconds for a SSL handshake to complete.
@@ -206,8 +225,10 @@ typedef enum {
  * @brief The different states the BlueCherry connection can be in.
  *
  * The progression is linear: nothing allocated, no credentials, credentials but no session,
- * session up. Only bluecherry_sync moves between them, and it is the only thing that touches
- * the network - bluecherry_init allocates and never connects.
+ * session up. Only the synchronisation task moves between them, and it is the only thing that
+ * touches the network - bluecherry_init allocates and never connects.
+ *
+ * Read with bluecherry_get_state, or subscribe with bluecherry_set_state_handler.
  */
 typedef enum {
   /**
@@ -229,23 +250,41 @@ typedef enum {
   BLUECHERRY_STATE_AWAIT_CONNECTION,
 
   /**
-   * @brief Session up, nothing outstanding.
+   * @brief Session up and nothing outstanding in either direction.
+   *
+   * Reached only when the server reported no more queued data, the internal priority slot is
+   * empty and the outgoing queue is empty. It is therefore the point at which an application
+   * can sleep without stranding unsent data - wait for it rather than assuming a returned
+   * bluecherry_sync means the work is done, because that call only starts the work.
    */
   BLUECHERRY_STATE_IDLE,
 
   /**
    * @brief A confirmable message is on the wire.
    *
-   * Set for the duration of a request/response exchange so a second, concurrent call to
-   * bluecherry_sync is rejected rather than corrupting the exchange.
+   * Transient, and entered once per transmitted message, so a state handler sees it often.
    */
   BLUECHERRY_STATE_AWAITING_RESPONSE,
 
   /**
-   * @brief The server signalled that it still has data queued for this device.
+   * @brief There is more to do: the server has data queued, an internal reply is waiting to go
+   * out, or the outgoing queue is not empty. The task keeps cycling until this clears.
    */
   BLUECHERRY_STATE_PENDING_MESSAGES
 } bluecherry_state;
+
+/**
+ * @brief Header of the function that is notified of connection state changes.
+ *
+ * Called on every transition, from the synchronisation task, so it must not block. Calling
+ * bluecherry_sync from it is safe: that only signals the task.
+ *
+ * @param state The state just entered.
+ * @param args Optional user arguments, passed when the handler was installed.
+ *
+ * @return None
+ */
+typedef void (*bluecherry_state_handler_t)(bluecherry_state state, void* args);
 
 /**
  * @brief The types of CoAP packets.
@@ -538,7 +577,7 @@ typedef struct {
  *
  * @param event The event that occurred.
  * @param info Details for the event, valid only for the duration of the call.
- * @param args The argument given to bluecherry_ota_set_handler.
+ * @param args The argument given to bluecherry_set_ota_handler.
  *
  * @return True if the application took this event's decision, false to let the
  * library apply its default.
@@ -600,16 +639,12 @@ static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
 #define BLUECHERRY_PROVISION_RETRY_MAX_MS 64000
 
 /**
- * @brief How long the synchronisation task sleeps between syncs.
- */
-#define BLUECHERRY_SYNC_POLL_MS 10
-
-/**
- * @brief The longest the synchronisation task will sleep while a backoff runs down.
+ * @brief The longest the synchronisation task will sleep while waiting for something to do.
  *
  * The task feeds the task watchdog once per iteration, so this bounds how long the watchdog
- * goes unfed while waiting - which is why the sleep is capped well under any usable watchdog
- * timeout instead of just sleeping until the deadline.
+ * goes unfed - which is why the wait is capped well under any usable watchdog timeout rather
+ * than simply sleeping until the next deadline. A trigger wakes the task immediately, so the
+ * cap costs nothing in responsiveness.
  */
 #define BLUECHERRY_SYNC_IDLE_MAX_MS 1000
 
@@ -703,6 +738,28 @@ typedef struct {
 } _ztp_cbor_t;
 
 /**
+ * @brief Where the queue of messages waiting to be published lives.
+ *
+ * Passed to bluecherry_init, or NULL to let the library allocate
+ * CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE bytes itself. Supplying a buffer is how an application
+ * decides both the size of the queue and the memory it comes out of - PSRAM and static arrays
+ * both work.
+ */
+typedef struct {
+  /**
+   * @brief The buffer, which the library borrows and never frees.
+   *
+   * It must stay valid until the application stops using the library.
+   */
+  uint8_t* buffer;
+
+  /**
+   * @brief The size of buffer in bytes. Must be at least BLUECHERRY_MIN_PUBLISH_BUFFER.
+   */
+  size_t size;
+} bluecherry_publish_buffer_t;
+
+/**
  * @brief This structure represents a scheduled BlueCherry message.
  */
 typedef struct {
@@ -716,6 +773,58 @@ typedef struct {
    */
   uint8_t* data;
 } _bluecherry_msg_t;
+
+/**
+ * @brief The queue of messages waiting to be published, as a ring of framed records.
+ *
+ * Each record is a 2 byte little endian length followed by that many bytes, which are the
+ * message with room for its CoAP header already in front of it. A record is never split across
+ * the end of the buffer: the transmit path writes the CoAP header into the record in place and
+ * retransmits from it, so what is handed out has to be one contiguous run of bytes. When a
+ * record does not fit at the end, wrap remembers where the used bytes stopped and writing
+ * restarts at 0.
+ */
+typedef struct {
+  /**
+   * @brief The bytes, either the application's or the library's own.
+   */
+  uint8_t* buf;
+
+  /**
+   * @brief The size of buf in bytes.
+   */
+  size_t size;
+
+  /**
+   * @brief Offset the next record is written at.
+   */
+  size_t head;
+
+  /**
+   * @brief Offset the oldest record starts at.
+   */
+  size_t tail;
+
+  /**
+   * @brief How far into buf the records reach; tail returns to 0 on arriving here.
+   */
+  size_t wrap;
+
+  /**
+   * @brief How many records are held. Tells a full ring from an empty one when head == tail.
+   */
+  size_t count;
+
+  /**
+   * @brief True when the library allocated buf and has to free it again.
+   */
+  bool owned;
+
+  /**
+   * @brief Guards every field above, since any task may publish.
+   */
+  SemaphoreHandle_t lock;
+} _bluecherry_ring_t;
 
 /**
  * @brief The operational data used by the BlueCherry cloud connection.
@@ -789,7 +898,7 @@ typedef struct {
   /**
    * @brief The outgoing message queue.
    */
-  QueueHandle_t out_queue;
+  _bluecherry_ring_t out_ring;
 
   /**
    * @brief The message handler or NULL to ignore incoming messages.
@@ -897,7 +1006,7 @@ typedef struct {
   /**
    * @brief Priority slot for one outgoing internal-channel (topic 0x00) frame.
    *
-   * Checked BEFORE out_queue in the send step - see bluecherry_sync for why.
+   * Checked BEFORE out_ring in the send step - see bluecherry_sync for why.
    * One slot suffices because every internal event is a reply the server then
    * responds to, so only one is ever outstanding.
    */
@@ -922,30 +1031,45 @@ typedef struct {
    * @brief Optional user pointer passed to the OTA handler.
    */
   void* ota_handler_args;
+
+  /**
+   * @brief Optional handler notified of every connection state change, or NULL.
+   */
+  bluecherry_state_handler_t state_handler;
+
+  /**
+   * @brief Optional user pointer passed to the state handler.
+   */
+  void* state_handler_args;
 } _bluecherry_t;
 
 /**
  * @brief Initialize the BlueCherry subsystem with an existing device certificate.
  *
- * Reserves the outgoing queue, the TLS contexts and - when auto_sync is set - the
- * synchronisation task. It does not touch the network: the connection is established by the
- * first bluecherry_sync, so this call cannot fail because the cloud is unreachable.
+ * Reserves the publish buffer, the TLS contexts and the synchronisation task. It does not touch
+ * the network: the connection is established by the first bluecherry_sync, so this call cannot
+ * fail because the cloud is unreachable.
  *
  * @param device_cert The BlueCherry device certificate in PEM format.
  * @param device_key The BlueCherry device certificate's key in PEM format.
  * @param msg_handler The handler used for incoming messages or NULL to ignore them.
  * @param msg_handler_args Optional user pointer which is passed to the message handler.
- * @param auto_sync When set to true, the library will automatically perform syncs in the
- * background.
+ * @param auto_sync Deprecated, use bluecherry_set_auto_sync instead. True is equivalent to
+ * calling it with CONFIG_BLUECHERRY_AUTO_SYNC_SEC and logs a warning. The synchronisation task
+ * is now always started, because bluecherry_sync needs it either way.
  * @param watchdog_timeout_seconds The timeout in seconds for the task watchdog. If not 0, your
  * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
  * Should be more than 30 seconds
+ * @param publish_buffer Where to keep messages waiting to be published, or NULL for a buffer of
+ * CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE bytes allocated here.
  *
- * @return ESP_OK on success.
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG on a publish buffer smaller than
+ * BLUECHERRY_MIN_PUBLISH_BUFFER.
  */
 esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
                           bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                          bool auto_sync, uint16_t watchdog_timeout_seconds);
+                          bool auto_sync, uint16_t watchdog_timeout_seconds,
+                          const bluecherry_publish_buffer_t* publish_buffer);
 
 /**
  * @brief Initialize the BlueCherry subsystem with zero-touch provisioning.
@@ -962,51 +1086,108 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
  * @param bc_device_type The BlueCherry device type string.
  * @param msg_handler The handler used for incoming messages or NULL to ignore them.
  * @param msg_handler_args Optional user pointer which is passed to the message handler.
- * @param auto_sync When set to true, the library will automatically perform syncs in the
- * background.
+ * @param auto_sync Deprecated, use bluecherry_set_auto_sync instead. True is equivalent to
+ * calling it with CONFIG_BLUECHERRY_AUTO_SYNC_SEC and logs a warning. The synchronisation task
+ * is now always started, because bluecherry_sync needs it either way.
  * @param watchdog_timeout_seconds The timeout in seconds for the task watchdog. If not 0, your
  * application should ensure that `esp_task_wdt_reset()` is repeatedly called within this time.
  * Should be more than 30 seconds
+ * @param publish_buffer Where to keep messages waiting to be published, or NULL for a buffer of
+ * CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE bytes allocated here.
  *
- * @return ESP_OK once initialized, ESP_ERR_INVALID_ARG on a missing handler or device type.
+ * @return ESP_OK once initialized, ESP_ERR_INVALID_ARG on a missing handler or device type, or on
+ * a publish buffer smaller than BLUECHERRY_MIN_PUBLISH_BUFFER.
  */
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
                               void* ztp_bio_handler_args, const char* bc_device_type,
                               bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                              bool auto_sync, uint16_t watchdog_timeout_seconds);
+                              bool auto_sync, uint16_t watchdog_timeout_seconds,
+                              const bluecherry_publish_buffer_t* publish_buffer);
 
 /**
- * @brief Synchronize incoming and outgoing BlueCherry messages and perform OTA.
+ * @brief Ask the synchronisation task to exchange messages with BlueCherry now.
  *
- * This is the only function that uses the network. In order, it provisions the device when it
- * has no credentials yet, opens the connection when there is none, sends one enqueued message,
- * and dispatches whatever came back - incoming messages to the message handler and firmware
- * updates to the OTA machinery.
+ * Returns as soon as the task has been signalled; it does not wait for the exchange. The task
+ * provisions the device if it has no credentials, opens the connection if there is none, sends
+ * what is queued and dispatches whatever came back - incoming messages to the message handler,
+ * firmware updates to the OTA machinery - and keeps cycling until nothing is outstanding.
  *
- * It works the same whether the application calls it itself or the automatic synchronisation
- * task does. Each step is back-off gated and returns ESP_ERR_NOT_FINISHED rather than blocking
- * until it succeeds, so calling this in a loop is what drives a device from freshly booted to
- * connected.
+ * This is a trigger, not a queue. Calling it repeatedly, or while a cycle is already running,
+ * collapses into a single extra cycle and still returns ESP_OK; a trigger raised during a cycle
+ * is never lost.
  *
- * @param blocking When true, the function will block until a message is sent or received, or the
- *                  CONFIG_BLUECHERRY_AUTO_SYNC_SEC timeout expires.
+ * Because nothing is reported back, an application that needs to know when the exchange settled
+ * waits for BLUECHERRY_STATE_IDLE, through bluecherry_get_state or a state handler.
  *
- * @return ESP_OK when finished, BLUECHERRY_SYNC_CONTINUE when more messages are pending,
- * ESP_ERR_NOT_FINISHED while still provisioning or connecting.
+ * @return ESP_OK when the task was signalled, ESP_ERR_INVALID_STATE before bluecherry_init.
  */
-esp_err_t bluecherry_sync(bool blocking);
+esp_err_t bluecherry_sync(void);
+
+/**
+ * @brief Start, retune or stop automatic synchronisation at runtime.
+ *
+ * The interval is a floor for *empty* synchronisations, not a schedule everything waits for:
+ * with it set, publishing also triggers a synchronisation straight away, and the interval only
+ * decides how long a device with nothing to say goes before checking in anyway. That check-in
+ * is what lets the server deliver downlink to a quiet device.
+ *
+ * The interval is counted from the last synchronisation, not from this call, so a change is
+ * applied to time already elapsed rather than restarting the wait. Three minutes after a
+ * synchronisation, setting it to five leaves two minutes to run; setting it to one makes a
+ * synchronisation due at once.
+ *
+ * Seconds, not milliseconds, on purpose - this paces traffic to the platform, and anything
+ * faster would only load it. It does not throttle the task's own behaviour: a cycle that ends
+ * with work outstanding is followed immediately by another, regardless of this setting.
+ *
+ * @param interval_sec Seconds between automatic synchronisations, or 0 to stop them and leave
+ * synchronisation entirely to bluecherry_sync.
+ *
+ * @return ESP_OK, or ESP_ERR_INVALID_STATE before bluecherry_init.
+ */
+esp_err_t bluecherry_set_auto_sync(uint32_t interval_sec);
+
+/**
+ * @brief Read the current connection state.
+ *
+ * @return The current state. BLUECHERRY_STATE_IDLE means nothing is outstanding in either
+ * direction and the device can sleep.
+ */
+bluecherry_state bluecherry_get_state(void);
+
+/**
+ * @brief Install a handler notified of every connection state change.
+ *
+ * The alternative to polling bluecherry_get_state. Register it before bluecherry_init so the
+ * first transitions are not missed.
+ *
+ * @param handler The handler, or NULL to stop being notified.
+ * @param args Optional user pointer passed to the handler.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bluecherry_set_state_handler(bluecherry_state_handler_t handler, void* args);
 
 /**
  * @brief Enqueue an MQTT message for publishing.
  *
- * This function will add the MQTT message to the outgoing message queue. After bluecherry_sync, the
- * messages will be forwarded to the designated broker.
+ * Copies the message into the publish buffer and returns; a synchronisation is what actually
+ * sends it. With automatic synchronisation enabled, one is scheduled here, so nothing further is
+ * needed. With it disabled there is no timer either, so the message waits in the buffer until
+ * bluecherry_sync is called.
+ *
+ * Nothing is dropped to make room: a message is kept until the cloud acknowledges it, so once the
+ * buffer is full further messages are refused until a synchronisation succeeds. Check the return
+ * value - it is the only sign that the connection is not keeping up.
+ *
+ * Safe to call from any task.
  *
  * @param topic The topic of the message, passed as the topic index.
  * @param len The length of the topic payload data.
  * @param data The topic payload data.
  *
- * @return ESP_OK on success.
+ * @return ESP_OK on success, ESP_ERR_NO_MEM when the publish buffer is full, ESP_ERR_INVALID_SIZE
+ * when the message is larger than the buffer or than BLUECHERRY_MAX_MESSAGE_LEN.
  */
 esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data);
 
@@ -1026,7 +1207,7 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data);
  *
  * @return ESP_OK on success.
  */
-esp_err_t bluecherry_ota_set_handler(bluecherry_ota_handler_t handler, void* args);
+esp_err_t bluecherry_set_ota_handler(bluecherry_ota_handler_t handler, void* args);
 
 /**
  * @brief Accept an offered update and begin the download.
