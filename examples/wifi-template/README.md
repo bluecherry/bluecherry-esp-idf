@@ -27,7 +27,7 @@ needs a certificate and a private key. **Zero-touch provisioning (ZTP) obtains t
 automatically**, so there is nothing to generate, flash or keep track of per device.
 
 On first boot the library asks the BlueCherry provisioning service for credentials, identifying
-itself by the device's **MAC address** - which is what links it to the Walter you registered on the
+itself by the device's **MAC address** - which is what links it to the device you registered on the
 BlueCherry platform. The credentials it is issued are handed to your storage callback
 (`bluecherry_ztp_bio_handler` in `main.c`, which puts them in NVS) and read back on every boot
 after that. Provisioning therefore happens exactly once.
