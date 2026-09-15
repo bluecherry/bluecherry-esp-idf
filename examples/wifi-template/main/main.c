@@ -23,20 +23,17 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <esp_chip_info.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
-#include <esp_event.h>
 #include <sdkconfig.h>
 #include <nvs_flash.h>
-#include <esp_wifi.h>
 #include <inttypes.h>
 #include <esp_log.h>
 #include <string.h>
 #include <stdio.h>
 
 #include "bluecherry.h"
-#include "credentials/wifi.h"
+#include "wifi.h"
 
 /**
  * @brief The BlueCherry device type for this application. Required for ZTP.
@@ -48,32 +45,19 @@
 #define BLUECHERRY_DEVICE_TYPE "walter01"
 
 /**
+ * @brief How much room to give messages that are waiting to be published.
+ */
+#define PUBLISH_BUFFER_SIZE 8192
+
+/**
  * @brief The logging tag for this application.
  */
 static const char* TAG = "EXAMPLE";
 
 /**
- * @brief The network interface used to connect to the WiFi.
- */
-static esp_netif_t* netif = NULL;
-
-/**
- * @brief The event handler for IP events.
- */
-static esp_event_handler_instance_t ip_evh;
-
-/**
- * @brief The event handler for WiFi events.
- */
-static esp_event_handler_instance_t wifi_evh;
-
-/**
- * @brief The WiFi event group handle.
- */
-static EventGroupHandle_t wifi_ev_group = NULL;
-
-/**
  * @brief The device certificate from the symbol section of the firmware.
+ *
+ * Only used by the pre-provisioned path, which is the uncommon one. See app_main.
  */
 extern const char devcert[] asm("_binary_devcert_pem_start");
 
@@ -83,101 +67,9 @@ extern const char devcert[] asm("_binary_devcert_pem_start");
 extern const char devkey[] asm("_binary_devkey_pem_start");
 
 /**
- * @brief Handle IP events.
- *
- * This function is called when an IP stack event occurs.
- *
- * @param arg A NULL pointer.
- * @param event_base Base event of type IP_EVENT.
- * @param event_id The specific event id.
- * @param event_data Event specific data.
- *
- * @return None.
- */
-static void ip_ev_cb(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-  ESP_LOGI(TAG, "Handling IP event, event code 0x%" PRIx32, event_id);
-  switch(event_id) {
-  case IP_EVENT_STA_GOT_IP:
-    ip_event_got_ip_t* event_ip = (ip_event_got_ip_t*) event_data;
-    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event_ip->ip_info.ip));
-    xEventGroupSetBits(wifi_ev_group, BIT0);
-    break;
-
-  case IP_EVENT_STA_LOST_IP:
-    ESP_LOGI(TAG, "Lost IP");
-    break;
-
-  case IP_EVENT_GOT_IP6:
-    ip_event_got_ip6_t* event_ip6 = (ip_event_got_ip6_t*) event_data;
-    ESP_LOGI(TAG, "Got IPv6: " IPV6STR, IPV62STR(event_ip6->ip6_info.ip));
-    xEventGroupSetBits(wifi_ev_group, BIT1);
-    break;
-
-  default:
-    ESP_LOGI(TAG, "IP event not handled");
-    break;
-  }
-}
-
-/**
- * @brief Handle WiFi events.
- *
- * This function is called when a WiFi event occurs.
- *
- * @param arg A NULL pointer.
- * @param event_base Base event of type WIFI_EVENT.
- * @param event_id The specific event id.
- * @param event_data Event specific data.
- *
- * @return None.
- */
-static void wifi_ev_cb(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-  ESP_LOGI(TAG, "Handling Wi-Fi event, event code 0x%" PRIx32, event_id);
-
-  switch(event_id) {
-  case WIFI_EVENT_WIFI_READY:
-    ESP_LOGI(TAG, "Wi-Fi ready");
-    break;
-
-  case WIFI_EVENT_SCAN_DONE:
-    ESP_LOGI(TAG, "Wi-Fi scan done");
-    break;
-
-  case WIFI_EVENT_STA_START:
-    ESP_LOGI(TAG, "Wi-Fi started, connecting to AP...");
-    esp_wifi_connect();
-    break;
-
-  case WIFI_EVENT_STA_STOP:
-    ESP_LOGI(TAG, "Wi-Fi stopped");
-    break;
-
-  case WIFI_EVENT_STA_CONNECTED:
-    ESP_LOGI(TAG, "Wi-Fi connected");
-    break;
-
-  case WIFI_EVENT_STA_DISCONNECTED:
-    ESP_LOGI(TAG, "Wi-Fi disconnected");
-    ESP_LOGI(TAG, "Retrying to connect to Wi-Fi network...");
-    esp_wifi_connect();
-    break;
-
-  case WIFI_EVENT_STA_AUTHMODE_CHANGE:
-    ESP_LOGI(TAG, "Wi-Fi authmode changed");
-    break;
-
-  default:
-    ESP_LOGI(TAG, "Wi-Fi event not handled");
-    break;
-  }
-}
-
-/**
  * @brief Initialize NVS.
  *
- * This function will initialize non-volatile storage memory.
+ * Needed by the WiFi stack, and by the credential storage below.
  *
  * @return ESP_OK on success.
  */
@@ -199,113 +91,6 @@ static esp_err_t nvs_init()
 
   ESP_LOGI(TAG, "Initialized non-volatile storage");
   return ESP_OK;
-}
-
-/**
- * @brief Initialize the WiFi as a station.
- *
- * This function will initialize the WiFi adapter and connect to the WiFi infrastructure.
- *
- * @param ssid The SSID to connect to.
- * @param password The password to use.
- * @param auth_mode The authentication method to use.
- *
- * @return ESP_OK on success.
- */
-static esp_err_t wifi_init(const char* ssid, const char* password, wifi_auth_mode_t auth_mode)
-{
-  esp_err_t ret = esp_netif_init();
-  if(ret != ESP_OK) {
-    ESP_LOGE(TAG, "Could not init the TCP/IP stack: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  wifi_ev_group = xEventGroupCreate();
-  if(wifi_ev_group == NULL) {
-    ESP_LOGE(TAG, "Failed to create WiFi event group");
-    return ESP_FAIL;
-  }
-
-  if((ret = esp_event_loop_create_default()) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not init the default event loop: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  if((ret = esp_wifi_set_default_wifi_sta_handlers()) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not set default WiFi STA event handlers: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  /* Create the WiFi station network interface */
-  netif = esp_netif_create_default_wifi_sta();
-  if(netif == NULL) {
-    ESP_LOGE(TAG, "Failed to create WiFi STA interface");
-    return ESP_FAIL;
-  }
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  if((ret = esp_wifi_init(&cfg)) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not initialize the WiFi adapter: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  ret = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_ev_cb, NULL,
-                                            &wifi_evh);
-  if(ret != ESP_OK) {
-    ESP_LOGE(TAG, "Could not set WiFi event handler: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  ret = esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &ip_ev_cb, NULL, &ip_evh);
-  if(ret != ESP_OK) {
-    ESP_LOGE(TAG, "Could not set IP event handler: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  wifi_config_t wifi_config = { 0 };
-  wifi_config.sta.threshold.authmode = auth_mode;
-  strncpy((char*) wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-  strncpy((char*) wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-
-  if((ret = esp_wifi_set_ps(WIFI_PS_NONE)) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not set WiFi power save mode to NONE: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  if((ret = esp_wifi_set_storage(WIFI_STORAGE_RAM)) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not set WiFi storage to RAM mode: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  if((ret = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK) {
-    ESP_LOGE(TAG, "Could net configure adapter in station mode: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  if((ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config)) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not apply the station configuration: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  ESP_LOGI(TAG, "Connecting to Wi-Fi network: %s", wifi_config.sta.ssid);
-  if((ret = esp_wifi_start()) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not start the WiFi adapter: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  EventBits_t bits =
-      xEventGroupWaitBits(wifi_ev_group, BIT0 | BIT1, pdFALSE, pdFALSE, portMAX_DELAY);
-
-  if(bits & BIT0) {
-    ESP_LOGI(TAG, "Connected to Wi-Fi network: %s", wifi_config.sta.ssid);
-    return ESP_OK;
-  } else if(bits & BIT1) {
-    ESP_LOGE(TAG, "Failed to connect to Wi-Fi network: %s", wifi_config.sta.ssid);
-    return ESP_FAIL;
-  }
-
-  ESP_LOGE(TAG, "Unknown error while connecting to WiFi");
-  return ESP_FAIL;
 }
 
 /**
@@ -407,26 +192,6 @@ static void bluecherry_state_handler(bluecherry_state state, void* args)
 }
 
 /**
- * @brief Write a string to NVS.
- *
- * This function writes a string value to NVS under the specified key.
- *
- * @param key The key under which to store the string.
- * @param value The string value to store.
- *
- * @return ESP_OK on success.
- */
-esp_err_t nvs_write_str(const char* key, const char* value)
-{
-  nvs_handle_t handle;
-  ESP_ERROR_CHECK(nvs_open("bcztp_store", NVS_READWRITE, &handle));
-  ESP_ERROR_CHECK(nvs_set_str(handle, key, value));
-  ESP_ERROR_CHECK(nvs_commit(handle));
-  nvs_close(handle);
-  return ESP_OK;
-}
-
-/**
  * @brief Read a string from NVS.
  *
  * This function reads a string value from NVS under the specified key.
@@ -437,7 +202,7 @@ esp_err_t nvs_write_str(const char* key, const char* value)
  *
  * @return ESP_OK on success.
  */
-esp_err_t nvs_read_str(const char* key, char* buf, size_t len)
+static esp_err_t nvs_read_str(const char* key, char* buf, size_t len)
 {
   nvs_handle_t handle;
   esp_err_t err = nvs_open("bcztp_store", NVS_READONLY, &handle);
@@ -450,7 +215,12 @@ esp_err_t nvs_read_str(const char* key, char* buf, size_t len)
 }
 
 /**
- * @brief Callback implementation for BlueCherry ZTP BIO handler.
+ * @brief Store and retrieve the credentials that zero-touch provisioning issues.
+ *
+ * ZTP hands the device a certificate and a private key the first time it runs, and expects to
+ * get them back on every boot after that. Where they live is up to the application - NVS here.
+ * Returning NULL when reading is how the library is told there are none yet, which is what
+ * makes it provision.
  *
  * @param read True when reading, false when writing.
  * @param secure True when handling the private key, false when handling the certificate.
@@ -504,7 +274,7 @@ void app_main(void)
   ESP_LOGI(TAG, "BlueCherry example V1.3.4");
 
   ESP_ERROR_CHECK(nvs_init());
-  ESP_ERROR_CHECK(wifi_init(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_MODE));
+  ESP_ERROR_CHECK(wifi_init());
 
   /* Optional. This handler takes both OTA decisions itself so the calls are visible; drop it,
    * or return false from those events, and the library downloads an offered update and reboots
@@ -516,17 +286,21 @@ void app_main(void)
 
   /* Messages waiting to be published are kept here. Put it wherever you like and make it as
    * large as you need - PSRAM below, or pass NULL instead to let the library allocate it. */
-  bluecherry_publish_buffer_t pub = { .buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM),
-                                      .size = 8192 };
+  bluecherry_publish_buffer_t pub = { .buffer =
+                                          heap_caps_malloc(PUBLISH_BUFFER_SIZE, MALLOC_CAP_SPIRAM),
+                                      .size = PUBLISH_BUFFER_SIZE };
 
-  /* Initialize bluecherry with pre-provisioned keys */
-  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, false, 30,
-  //                                 &pub));
-
-  /* Initialize bluecherry with zero-touch provisioning. */
+  /* Zero-touch provisioning: the device asks BlueCherry for its own certificate and key on first
+   * boot, using its MAC address to find the Walter it was registered as. Nothing to flash and
+   * nothing to keep track of - the handler above stores what it is issued. */
   ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
                                       bluecherry_msg_handler, NULL, false, 30,
                                       pub.buffer != NULL ? &pub : NULL));
+
+  /* The alternative, for the rare device whose credentials were issued by hand and built into
+   * the firmware. ZTP above is the normal way. */
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, false, 30,
+  //                                 pub.buffer != NULL ? &pub : NULL));
 
   /* Publishing schedules a synchronisation on its own; the 10 seconds is how long we go without
    * one when there is nothing to send. Call this again at any time to change the interval.
@@ -542,7 +316,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Publishing %s", payload);
 
-    /* Any bytes will do; the + 1 sends the terminating NUL along with the text. */
+    /* Queue the payload for publishing to the BlueCherry cloud*/
     esp_err_t err = bluecherry_publish(0x84, strlen(payload) + 1, (const uint8_t*) payload);
     if(err != ESP_OK) {
       ESP_LOGW(TAG, "Publish rejected, queue full: %s", esp_err_to_name(err));
