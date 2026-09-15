@@ -31,3 +31,13 @@ menu "BLUECHERRY Configuration"
             PSRAM or in memory the application reserved itself.
 
 endmenu
+
+#  - MBEDTLS_SSL_PROTO_DTLS: the transport. Defaults to n in every ESP-IDF 5.x and 6.x.
+#  - MBEDTLS_X509_CREATE_C: the X.509 CSR writer bluecherry_init_ztp builds its request with.
+#    ESP-IDF 6 made it optional and defaults it off; 5.x compiles it in unconditionally and has
+#    no such symbol, where selecting it is silently ignored.
+config BLUECHERRY_MBEDTLS_REQUIREMENTS
+    bool
+    default y
+    select MBEDTLS_SSL_PROTO_DTLS
+    select MBEDTLS_X509_CREATE_C

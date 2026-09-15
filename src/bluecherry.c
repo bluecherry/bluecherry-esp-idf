@@ -1438,13 +1438,13 @@ static int _bluecherry_mbed_dtls_write(const unsigned char* buf, size_t len)
 /**
  * @brief Finalize the CSR generation process.
  *
- * Releases only what the CSR itself owns. The entropy and CTR_DRBG contexts are deliberately
- * NOT freed here: they are seeded once in _bluecherry_setup_mbedtls and ssl_conf keeps a
- * pointer to the DRBG for the lifetime of the library (mbedtls_ssl_conf_rng), so freeing them
- * would leave every later handshake running on a zeroed generator with no entropy source.
- * _bluecherry_cleanup_mbedtls is what frees them, at teardown. devkey is safe to free because
- * the key has already been written out as PEM and _bluecherry_configure_own_cert re-inits the
- * context before parsing it back.
+ * Releases only what the CSR itself owns. On Mbed TLS 3 the entropy and CTR_DRBG contexts are
+ * deliberately NOT freed here: they are seeded once in _bluecherry_setup_mbedtls and ssl_conf
+ * keeps a pointer to the DRBG for the lifetime of the library (mbedtls_ssl_conf_rng), so freeing
+ * them would leave every later handshake running on a zeroed generator with no entropy source.
+ * _bluecherry_cleanup_mbedtls is what frees them, at teardown. Mbed TLS 4 has neither context.
+ * devkey is safe to free because the key has already been written out as PEM and
+ * _bluecherry_configure_own_cert re-inits the context before parsing it back.
  *
  * @param result The result of the CSR generation process.
  *
@@ -1472,8 +1472,10 @@ static void _bluecherry_cleanup_mbedtls()
 {
   mbedtls_ssl_free(&_bluecherry_opdata.ssl);
   mbedtls_ssl_config_free(&_bluecherry_opdata.ssl_conf);
+#if MBEDTLS_VERSION_MAJOR < 4
   mbedtls_ctr_drbg_free(&_bluecherry_opdata.ctr_drbg);
   mbedtls_entropy_free(&_bluecherry_opdata.entropy);
+#endif
   mbedtls_x509_crt_free(&_bluecherry_opdata.cacert);
   mbedtls_x509_crt_free(&_bluecherry_opdata.devcert);
   mbedtls_pk_free(&_bluecherry_opdata.devkey);
@@ -1519,19 +1521,37 @@ static bool _bluecherry_setup_mbedtls(const uint8_t* mac)
 {
   mbedtls_ssl_init(&_bluecherry_opdata.ssl);
   mbedtls_ssl_config_init(&_bluecherry_opdata.ssl_conf);
+#if MBEDTLS_VERSION_MAJOR < 4
   mbedtls_ctr_drbg_init(&_bluecherry_opdata.ctr_drbg);
   mbedtls_entropy_init(&_bluecherry_opdata.entropy);
+#endif
   mbedtls_x509_crt_init(&_bluecherry_opdata.cacert);
   mbedtls_x509_crt_init(&_bluecherry_opdata.devcert);
   mbedtls_pk_init(&_bluecherry_opdata.devkey);
   _bluecherry_opdata.sock = -1;
 
-  int ret = mbedtls_ctr_drbg_seed(&_bluecherry_opdata.ctr_drbg, mbedtls_entropy_func,
-                                  &_bluecherry_opdata.entropy, mac, 6);
+  int ret;
+
+#if MBEDTLS_VERSION_MAJOR >= 4
+  /* Mbed TLS 4 has no DRBG to seed and nowhere to put a personalisation string - randomness
+   * comes from PSA, which ESP-IDF already initialises during system startup. Calling it again
+   * is defined to be a no-op, and doing so keeps this correct if that ever stops being
+   * automatic. The MAC is unused on this path; it stays in the signature for the Mbed TLS 3
+   * one. */
+  (void) mac;
+  psa_status_t pret = psa_crypto_init();
+  if(pret != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "Could not initialise PSA crypto: %d", (int) pret);
+    return false;
+  }
+#else
+  ret = mbedtls_ctr_drbg_seed(&_bluecherry_opdata.ctr_drbg, mbedtls_entropy_func,
+                              &_bluecherry_opdata.entropy, mac, 6);
   if(ret != 0) {
     ESP_LOGE(TAG, "Could not seed RNG: -%04X", -ret);
     return false;
   }
+#endif
 
   ret = mbedtls_ssl_config_defaults(&_bluecherry_opdata.ssl_conf, MBEDTLS_SSL_IS_CLIENT,
                                     MBEDTLS_SSL_TRANSPORT_DATAGRAM, MBEDTLS_SSL_PRESET_DEFAULT);
@@ -1542,8 +1562,10 @@ static bool _bluecherry_setup_mbedtls(const uint8_t* mac)
 
   mbedtls_ssl_conf_read_timeout(&_bluecherry_opdata.ssl_conf, BLUECHERRY_SSL_READ_TIMEOUT);
   mbedtls_ssl_conf_authmode(&_bluecherry_opdata.ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+#if MBEDTLS_VERSION_MAJOR < 4
   mbedtls_ssl_conf_rng(&_bluecherry_opdata.ssl_conf, mbedtls_ctr_drbg_random,
                        &_bluecherry_opdata.ctr_drbg);
+#endif
   return true;
 }
 
@@ -1606,9 +1628,16 @@ static bool _bluecherry_configure_own_cert(const char* dev_cert, const char* dev
     return false;
   }
 
+  /* Mbed TLS 3 wants an RNG for blinding while it parses; 4 takes it from PSA and dropped the
+   * two arguments. */
+#if MBEDTLS_VERSION_MAJOR >= 4
   ret = mbedtls_pk_parse_key(&_bluecherry_opdata.devkey, (const uint8_t*) dev_key,
-                             strlen(dev_key) + 1, NULL, 0, mbedtls_entropy_func,
+                             strlen(dev_key) + 1, NULL, 0);
+#else
+  ret = mbedtls_pk_parse_key(&_bluecherry_opdata.devkey, (const uint8_t*) dev_key,
+                             strlen(dev_key) + 1, NULL, 0, mbedtls_ctr_drbg_random,
                              &_bluecherry_opdata.ctr_drbg);
+#endif
   if(ret != 0) {
     ESP_LOGE(TAG, "Could not parse device key: -%04X", -ret);
     return false;
@@ -2505,6 +2534,31 @@ static bool _ztp_generate_key_and_csr()
   mbedtls_pk_init(&_bluecherry_opdata.devkey);
   mbedtls_x509write_csr_init(&_bluecherry_opdata.ztp_mb_csr);
 
+  /* Generate the P-256 key pair. Mbed TLS 4 took mbedtls_pk_setup, mbedtls_pk_ec and
+   * mbedtls_ecp_gen_key out of the public API: a key is made by PSA and then copied into the pk
+   * context, which is what x509write_csr signs with. PSA_KEY_USAGE_EXPORT is what makes that
+   * copy legal - mbedtls_pk_copy_from_psa refuses a key it cannot export. It copies the material
+   * out rather than aliasing the slot and discards the policy with it, so the PSA key is
+   * destroyed straight after; holding it would leak one volatile slot per provisioning
+   * attempt. */
+#if MBEDTLS_VERSION_MAJOR >= 4
+  psa_key_attributes_t key_attr = PSA_KEY_ATTRIBUTES_INIT;
+  psa_set_key_type(&key_attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+  psa_set_key_bits(&key_attr, 256);
+  psa_set_key_usage_flags(&key_attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
+  psa_set_key_algorithm(&key_attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+
+  mbedtls_svc_key_id_t psa_key = MBEDTLS_SVC_KEY_ID_INIT;
+  if(psa_generate_key(&key_attr, &psa_key) != PSA_SUCCESS) {
+    return _ztp_finish_csr_gen(false);
+  }
+
+  int copy_ret = mbedtls_pk_copy_from_psa(psa_key, &_bluecherry_opdata.devkey);
+  psa_destroy_key(psa_key);
+  if(copy_ret != 0) {
+    return _ztp_finish_csr_gen(false);
+  }
+#else
   if(mbedtls_pk_setup(&_bluecherry_opdata.devkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) !=
      0) {
     return _ztp_finish_csr_gen(false);
@@ -2514,6 +2568,7 @@ static bool _ztp_generate_key_and_csr()
                          mbedtls_ctr_drbg_random, &_bluecherry_opdata.ctr_drbg) != 0) {
     return _ztp_finish_csr_gen(false);
   }
+#endif
 
   if(mbedtls_pk_write_key_pem(&_bluecherry_opdata.devkey, (unsigned char*) ztp_pkey_buf,
                               BLUECHERRY_ZTP_PKEY_BUF_SIZE) != 0) {
@@ -2528,9 +2583,14 @@ static bool _ztp_generate_key_and_csr()
     return _ztp_finish_csr_gen(false);
   }
 
+#if MBEDTLS_VERSION_MAJOR >= 4
+  ret = mbedtls_x509write_csr_der(&_bluecherry_opdata.ztp_mb_csr, csr_buf,
+                                  BLUECHERRY_ZTP_CERT_BUF_SIZE);
+#else
   ret = mbedtls_x509write_csr_der(&_bluecherry_opdata.ztp_mb_csr, csr_buf,
                                   BLUECHERRY_ZTP_CERT_BUF_SIZE, mbedtls_ctr_drbg_random,
                                   &_bluecherry_opdata.ctr_drbg);
+#endif
   if(ret < 0) {
     ESP_LOGE(TAG, "Failed to write CSR DER: -0x%04X", -ret);
     return _ztp_finish_csr_gen(false);
@@ -2752,9 +2812,6 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
   }
 
   if(watchdog_timeout_seconds > 0) {
-#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
-    esp_task_wdt_init(watchdog_timeout_seconds, true);
-#else
     esp_task_wdt_config_t twdt_config = { .timeout_ms =
                                               (uint32_t) (watchdog_timeout_seconds * 1000UL),
                                           .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
@@ -2763,7 +2820,6 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
     esp_task_wdt_reconfigure(&twdt_config);
 #else
     esp_task_wdt_init(&twdt_config);
-#endif
 #endif
     _watchdog = true;
   }

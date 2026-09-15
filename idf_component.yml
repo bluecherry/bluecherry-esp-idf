@@ -24,4 +24,4 @@ targets:
   - esp32c5
 dependencies:
   idf:
-    version: ">=4.1.0"
+    version: ">=5.0.0"
