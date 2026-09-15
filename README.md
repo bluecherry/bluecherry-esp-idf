@@ -58,7 +58,7 @@ the `idf_components.yml` file inside the `main` folder of your project:
 ```yml
 dependencies:
   bluecherry/bluecherry:
-    version: ">=1.3.4"
+    version: ">=1.4.0"
 ```
 
 ### Connect to the platform
@@ -78,7 +78,11 @@ void msg_handler(uint8_t topic, uint16_t len, const uint8_t *data, void *args)
  * messages waiting to be published are kept - NULL for a buffer allocated here.
  * This call reserves buffers and starts the background sync task; it does not touch the
  * network, so it does not need to be retried when the cloud is unreachable. */
-bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60, NULL);
+bluecherry_init(device_cert, device_key, msg_handler, NULL, false, 60, NULL);
+
+/* Check in with the cloud at least every 10 seconds. Leave this out to synchronise only
+ * when your application calls bluecherry_sync itself. */
+bluecherry_set_auto_sync(10);
 
 while(true) {
   bluecherry_publish(0x84, strlen("Hello World") + 1, (const uint8_t*) "Hello World");
@@ -87,8 +91,15 @@ while(true) {
 ```
 
 Messages are queued, not sent: `bluecherry_publish` copies the payload into the publish buffer and
-returns. `bluecherry_sync` is what talks to the cloud - the background task above calls it for
-you, or you can set `auto_sync` to false and call it yourself.
+returns. A background task is what talks to the cloud. Publishing wakes it straight away, so the
+interval given to `bluecherry_set_auto_sync` is really a floor for *empty* synchronisations - how
+long a device with nothing to say waits before checking in anyway, which is what lets the platform
+deliver downlink to a quiet device. Passing `0` stops that and leaves the timing entirely to your
+own `bluecherry_sync` calls.
+
+`bluecherry_sync` only signals that task and returns; it does not wait for the exchange. To know
+that a message has actually left, wait for `BLUECHERRY_STATE_IDLE` through `bluecherry_get_state`
+or `bluecherry_set_state_handler` - which is also the moment it is safe to sleep.
 
 Nothing is dropped to make room: a message stays in the buffer until the cloud acknowledges it, so
 `bluecherry_publish` returns `ESP_ERR_NO_MEM` once the buffer is full and the connection is not
@@ -98,7 +109,7 @@ is and where it comes from - PSRAM, say, or memory your application reserved its
 ```c
 bluecherry_publish_buffer_t pub = { .buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM),
                                     .size = 8192 };
-bluecherry_init(device_cert, device_key, msg_handler, NULL, true, 60, &pub);
+bluecherry_init(device_cert, device_key, msg_handler, NULL, false, 60, &pub);
 ```
 
 With `NULL` the library allocates `CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE` bytes itself.
@@ -120,7 +131,7 @@ paid cellular plains this is a huge win.
 ## Licence 
 
 The library is published under the 'GNU LESSER GENERAL PUBLIC LICENSE'. The full license text can 
-be read [here](license.md).
+be read [here](LICENSE.md).
 
 ## Over-the-air updates
 
