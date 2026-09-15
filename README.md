@@ -30,6 +30,20 @@ with LPWAN cellular.
 
 ## Getting started
 
+### Supported ESP-IDF versions
+
+**ESP-IDF 5.0 and above**, including the whole 5.x series and 6.x. Nothing has to be configured
+on your side - add the component and build.
+
+The two generations differ in their crypto library: 5.x ships Mbed TLS 3, 6.x ships Mbed TLS 4,
+which withdrew the standalone random number generator and moved EC key generation to PSA. The
+library picks the right one at compile time.
+
+The two mbedtls options it cannot work without - DTLS, and the X.509 CSR writer that zero-touch
+provisioning builds its request with - both default to off, so the component's `Kconfig` selects
+them. A `select` wins over a value your own `sdkconfig` sets, which is deliberate: they are
+requirements rather than preferences.
+
 ### Add the dependency
 
 Add the BlueCherry component to your project using the `idf.py` command:

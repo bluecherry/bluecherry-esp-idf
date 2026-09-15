@@ -316,8 +316,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Publishing %s", payload);
 
-    /* Queue the payload for publishing to the BlueCherry cloud*/
-    esp_err_t err = bluecherry_publish(0x84, strlen(payload) + 1, (const uint8_t*) payload);
+    /* Queue the payload for publishing to the BlueCherry cloud. */
+    esp_err_t err = bluecherry_publish(0x84, strlen(payload), (const uint8_t*) payload);
     if(err != ESP_OK) {
       ESP_LOGW(TAG, "Publish rejected, queue full: %s", esp_err_to_name(err));
     }

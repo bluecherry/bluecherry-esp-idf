@@ -21,14 +21,12 @@
  */
 
 #include <mbedtls/net_sockets.h>
-#include <bootloader_random.h>
 #include <freertos/FreeRTOS.h>
 #include <mbedtls/platform.h>
-#include <mbedtls/ctr_drbg.h>
 #include <esp_image_format.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/x509_csr.h>
-#include <mbedtls/entropy.h>
+#include <mbedtls/version.h>
 #include <spi_flash_mmap.h>
 #include <mbedtls/timing.h>
 #include <freertos/queue.h>
@@ -40,14 +38,11 @@
 #include <esp_task_wdt.h>
 #include <lwip/sockets.h>
 #include <esp_ota_ops.h>
-#include <esp_vfs_fat.h>
 #include <mbedtls/pem.h>
 #include <mbedtls/pk.h>
-#include <esp_random.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <inttypes.h>
-#include <esp_vfs.h>
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_err.h>
@@ -59,6 +54,33 @@
 #include <netdb.h>
 #include <errno.h>
 #include <time.h>
+
+/* Mbed TLS 4 - what ESP-IDF 6 ships - withdrew the standalone RNG. mbedtls/ctr_drbg.h and
+ * mbedtls/entropy.h are private headers there, the library draws randomness from PSA itself,
+ * and the f_rng / p_rng arguments are gone from every call that used to take them. Key
+ * generation moved out of the pk module into PSA as well. ESP-IDF 5 ships Mbed TLS 3, which has
+ * all of it.
+ *
+ * mbedtls/version.h is public in both, so it is what decides which of the two worlds this build
+ * is in. Everything version-dependent in this library keys off MBEDTLS_VERSION_MAJOR rather
+ * than off ESP_IDF_VERSION, because it is the crypto library that changed, not the framework. */
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include <psa/crypto.h>
+#else
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#endif
+
+/* Backstop for the selects in this component's Kconfig. Both options default to n, and without
+ * them the failure is invisible at build time: no DTLS means mbedtls_ssl_config_defaults fails
+ * on a device, no CSR writer means ZTP dies at link with an mbedtls symbol name that does not
+ * say which option to turn on. Say it here instead. */
+#if !defined(MBEDTLS_SSL_PROTO_DTLS)
+#error "BlueCherry is DTLS-only: enable CONFIG_MBEDTLS_SSL_PROTO_DTLS"
+#endif
+#if !defined(MBEDTLS_X509_CSR_WRITE_C)
+#error "BlueCherry provisioning writes a CSR: enable CONFIG_MBEDTLS_X509_CREATE_C"
+#endif
 
 #ifndef BLUECHERRY_H
 #define BLUECHERRY_H
@@ -845,15 +867,21 @@ typedef struct {
    */
   mbedtls_ssl_config ssl_conf;
 
+#if MBEDTLS_VERSION_MAJOR < 4
   /**
    * @brief The Mbed TLS random number generator context and state.
+   *
+   * Absent on Mbed TLS 4 (ESP-IDF 6), which has no public DRBG and seeds itself through PSA.
    */
   mbedtls_ctr_drbg_context ctr_drbg;
 
   /**
    * @brief The Mbed TLS entropy context.
+   *
+   * Absent on Mbed TLS 4, for the same reason as ctr_drbg.
    */
   mbedtls_entropy_context entropy;
+#endif
 
   /**
    * @brief The server certificate.
