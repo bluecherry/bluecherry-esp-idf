@@ -30,4 +30,11 @@ menu "BLUECHERRY Configuration"
             can never be queued at all. Pass a buffer to bluecherry_init to place this in
             PSRAM or in memory the application reserved itself.
 
+    config BLUECHERRY_OTA_SIGNING_KEY
+        string "Path to ED25519 Private Key (YubiKey/SSH)"
+        default "~/.ssh/id_ed25519_OTA_update"
+        help
+            The path to the private key file used for signing the OTA payload.
+            Supports SSH resident keys backed by hardware tokens like YubiKeys.
+
 endmenu
