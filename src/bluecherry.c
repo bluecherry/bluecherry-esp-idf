@@ -147,6 +147,25 @@ static volatile bool _ota_abort_req = false;
 static volatile uint8_t _ota_abort_code = 0;
 
 /**
+ * @brief Guards the connection state and the request flag below.
+ *
+ * A spinlock rather than a mutex, because what it protects is a decision immediately followed by
+ * the assignment it decided on, nothing under it ever blocks, and the two tasks involved can be on
+ * different cores. The state handler is always called outside it.
+ */
+static portMUX_TYPE _bluecherry_state_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/**
+ * @brief Raised when an exchange is asked for, cleared by the task as it starts one.
+ *
+ * Counting the outgoing ring takes the ring's mutex, which cannot be held inside a critical
+ * section, so the end of a cycle has to read that count before it takes this lock. This flag
+ * closes the gap: it is raised under the same lock the decision is made under, so a message queued
+ * in between cannot be settled past.
+ */
+static bool _sync_requested = false;
+
+/**
  * @brief Tickle the task watchdog if enabled.
  *
  * This function tickles the task watchdog if it is enabled.
@@ -167,15 +186,75 @@ static void _bluecherry_tickle_watchdog(void)
  */
 static void _bluecherry_set_state(bluecherry_state next)
 {
-  if(_bluecherry_opdata.state == next) {
-    return;
+  bool changed = false;
+
+  portENTER_CRITICAL(&_bluecherry_state_lock);
+  if(_bluecherry_opdata.state != next) {
+    _bluecherry_opdata.state = next;
+    changed = true;
   }
+  portEXIT_CRITICAL(&_bluecherry_state_lock);
 
-  _bluecherry_opdata.state = next;
-
-  if(_bluecherry_opdata.state_handler != NULL) {
+  /* Reported outside the lock, and only while this is still the current state. A publish or a sync
+   * that promoted out of it in between has its own transition to report, and delivering a state it
+   * has already superseded would tell the application the opposite of what is true. */
+  if(changed && _bluecherry_opdata.state == next && _bluecherry_opdata.state_handler != NULL) {
     _bluecherry_opdata.state_handler(next, _bluecherry_opdata.state_handler_args);
   }
+}
+
+/**
+ * @brief Record that an exchange has been asked for and take the state out of idle.
+ *
+ * Both halves happen under one lock, so a cycle settling concurrently on the task either sees the
+ * request and holds the state at BLUECHERRY_STATE_PENDING_MESSAGES, or settles to idle first and
+ * is promoted back out of it here. Either way the state is no longer idle by the time the caller
+ * gets control back, which is what lets an application ask for an exchange and then look at the
+ * state without racing the task.
+ */
+static void _bluecherry_request_sync(void)
+{
+  bool changed = false;
+
+  portENTER_CRITICAL(&_bluecherry_state_lock);
+  _sync_requested = true;
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_IDLE) {
+    _bluecherry_opdata.state = BLUECHERRY_STATE_PENDING_MESSAGES;
+    changed = true;
+  }
+  portEXIT_CRITICAL(&_bluecherry_state_lock);
+
+  if(changed && _bluecherry_opdata.state_handler != NULL) {
+    _bluecherry_opdata.state_handler(BLUECHERRY_STATE_PENDING_MESSAGES,
+                                     _bluecherry_opdata.state_handler_args);
+  }
+}
+
+/**
+ * @brief Settle the state at the end of a cycle, atomically against publish and sync.
+ *
+ * @param pending Whether anything is still outstanding, evaluated before the lock is taken.
+ *
+ * @return The state settled on.
+ */
+static bluecherry_state _bluecherry_settle_to(bool pending)
+{
+  bluecherry_state next;
+  bool changed = false;
+
+  portENTER_CRITICAL(&_bluecherry_state_lock);
+  next = (pending || _sync_requested) ? BLUECHERRY_STATE_PENDING_MESSAGES : BLUECHERRY_STATE_IDLE;
+  if(_bluecherry_opdata.state != next) {
+    _bluecherry_opdata.state = next;
+    changed = true;
+  }
+  portEXIT_CRITICAL(&_bluecherry_state_lock);
+
+  if(changed && _bluecherry_opdata.state == next && _bluecherry_opdata.state_handler != NULL) {
+    _bluecherry_opdata.state_handler(next, _bluecherry_opdata.state_handler_args);
+  }
+
+  return next;
 }
 
 /**
@@ -431,8 +510,7 @@ static void _bluecherry_settle_state(void)
     return;
   }
 
-  _bluecherry_set_state(_bluecherry_work_pending(false) ? BLUECHERRY_STATE_PENDING_MESSAGES
-                                                        : BLUECHERRY_STATE_IDLE);
+  _bluecherry_settle_to(_bluecherry_work_pending(false));
 }
 
 /**
@@ -546,6 +624,12 @@ static void _bluecherry_sync_task(void* args)
     if(triggered == 0 && !_bluecherry_sync_due()) {
       continue;
     }
+
+    /* Cleared as the cycle starts rather than when it ends, so a publish or a sync that arrives
+     * while this one is running still holds the state out of idle afterwards. */
+    portENTER_CRITICAL(&_bluecherry_state_lock);
+    _sync_requested = false;
+    portEXIT_CRITICAL(&_bluecherry_state_lock);
 
     _bluecherry_ota_service_requests();
 
@@ -3144,12 +3228,11 @@ static esp_err_t _bluecherry_sync_once(void)
 
   /* An application is entitled to sleep on IDLE, so the server having more queued is only one
    * way this can be unsettled - the outgoing queue and a just-queued reply count too. */
-  if(_bluecherry_work_pending(want_resync)) {
-    _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
+  if(_bluecherry_settle_to(_bluecherry_work_pending(want_resync)) ==
+     BLUECHERRY_STATE_PENDING_MESSAGES) {
     return BLUECHERRY_SYNC_CONTINUE;
   }
 
-  _bluecherry_set_state(BLUECHERRY_STATE_IDLE);
   return ESP_OK;
 }
 
@@ -3166,6 +3249,13 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
   if(ret != ESP_OK) {
     return ret;
   }
+
+  /* Reported before this returns rather than when the task gets round to it. An application
+   * waiting for BLUECHERRY_STATE_IDLE before it sleeps would otherwise see the idle left over from
+   * the previous cycle, conclude that nothing is outstanding, and sleep on top of the message it
+   * just queued. Done whether or not the interval below triggers a run, because the message is
+   * queued either way. */
+  _bluecherry_request_sync();
 
   /* Something to send is reason enough to run: the interval exists to force an empty sync when
    * there is nothing queued, not to hold queued messages back. With auto-sync off there is no
@@ -3214,6 +3304,13 @@ esp_err_t bluecherry_sync(void)
   if(_sync_task == NULL || _bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
     return ESP_ERR_INVALID_STATE;
   }
+
+  /* Same reason as in bluecherry_publish: the caller has asked for an exchange, so the state has
+   * to say one is outstanding before this returns. Waiting for the task to say so leaves a window
+   * in which the previous cycle's idle is still showing, and that window is the whole scheduling
+   * gap plus everything the cycle does before its first write. A cycle with nothing to do settles
+   * straight back to idle. */
+  _bluecherry_request_sync();
 
   xTaskNotifyGive(_sync_task);
   return ESP_OK;
