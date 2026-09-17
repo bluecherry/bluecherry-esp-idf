@@ -1966,7 +1966,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
         }
 
         if(rsp_message_id != tx_message_id) {
-          ESP_LOGW(TAG,
+          ESP_LOGD(TAG,
                    "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
                    rsp_message_id, tx_message_id);
           continue;
