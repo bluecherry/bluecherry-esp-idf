@@ -1930,7 +1930,7 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
   data[4] = 0xFF;
 
   double timeout = BLUECHERRY_ACK_TIMEOUT *
-                   (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
+                   (1 + (esp_random() / 4294967296.0) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
 
   for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
     _bluecherry_opdata.last_tx_time = time(NULL);
@@ -2044,7 +2044,8 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
     data_len = header_len + 1 + tx_len;
   }
 
-  double timeout = 2.0 * (1 + (rand() / (RAND_MAX + 1.0)) * (1.5 - 1));
+  double timeout = BLUECHERRY_ACK_TIMEOUT *
+                   (1 + (esp_random() / 4294967296.0) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
 
   /* Receive into the session buffer instead of a second kilobyte of stack. Provisioning only
    * runs from BLUECHERRY_STATE_NOT_PROVISIONED, before any CoAP session exists, so in_buf is
@@ -2053,7 +2054,7 @@ static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, u
   uint8_t* rx_scratch = _bluecherry_opdata.in_buf;
   const size_t rx_scratch_cap = sizeof(_bluecherry_opdata.in_buf);
 
-  for(uint8_t attempt = 1; attempt <= 4; ++attempt) {
+  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
     last_tx_time = time(NULL);
     _bluecherry_tickle_watchdog();
 

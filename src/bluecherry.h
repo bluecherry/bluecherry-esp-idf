@@ -41,6 +41,7 @@
 #include <mbedtls/pem.h>
 #include <mbedtls/pk.h>
 #include <esp_system.h>
+#include <esp_random.h>
 #include <esp_timer.h>
 #include <inttypes.h>
 #include <esp_log.h>
@@ -626,19 +627,26 @@ static const UBaseType_t BLUECHERRY_SP = 10;
 #define BLUECHERRY_MQTT_HEADER_SIZE 2U
 
 /**
- * @brief The maximum number of CoAP retransmits.
+ * @brief The maximum number of CoAP transmissions, the first included.
+ *
+ * Together with the timeouts below, deliberately slower than the RFC 7252 defaults to limit
+ * retransmits on a slow link: the waits are 4, 8 and 16 s times the random factor, 28 to 30 s in
+ * total.
  */
-static const uint8_t BLUECHERRY_MAX_RETRANSMITS = 4;
+static const uint8_t BLUECHERRY_MAX_RETRANSMITS = 3;
 
 /**
- * @brief The CoAP acknowledgement base timeout period.
+ * @brief The CoAP acknowledgement base timeout period, in seconds.
  */
-static const double BLUECHERRY_ACK_TIMEOUT = 2.0;
+static const double BLUECHERRY_ACK_TIMEOUT = 4.0;
 
 /**
  * @brief The CoAP acknowledgement timeout period randomness factor.
+ *
+ * Drawn with esp_random(), not rand(), which is never seeded and would draw the same factor on
+ * every device.
  */
-static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.5;
+static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.07;
 
 /**
  * @brief The maximum number of milliseconds to wait for a datagram to arrive on a socket.
