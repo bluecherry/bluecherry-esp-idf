@@ -353,22 +353,25 @@ typedef enum {
   BLUECHERRY_EVENT_TYPE_PARTITION_HASH =
       9, // Client -> Server: Sends the currently running partition hash to the server. Server can
          // use this to verify if an OTA was received.
+  BLUECHERRY_EVENT_TYPE_INIT_INFO =
+      10, // Client -> Server: Sends initial information about the client to the server.
   BLUECHERRY_EVENT_TYPE_OTA_INITIALIZE =
-      10, // Server -> Client: Informs the client an OTA update is available. Server reports the
+      11, // Server -> Client: Informs the client an OTA update is available. Server reports the
           // total size, hash, and version number
   BLUECHERRY_EVENT_TYPE_OTA_START =
-      11, // Client -> Server: Requests the start of the OTA update. Echoes back the version number
+      12, // Client -> Server: Requests the start of the OTA update. Echoes back the version number
           // so the server can verify it matches the intended update.
-  BLUECHERRY_EVENT_TYPE_OTA_CHUNK = 12, // Server -> Client: Sends a chunk of the OTA update
+  BLUECHERRY_EVENT_TYPE_OTA_CHUNK = 13, // Server -> Client: Sends a chunk of the OTA update
+  BLUECHERRY_EVENT_TYPE_OTA_RESUME =
+      14, // Client -> Server: After a reconnect, reports how many bytes of the interrupted update
+          // are already written, so the server continues from there.
   BLUECHERRY_EVENT_TYPE_OTA_VERIFIED =
-      13, // Client -> Server: Informs the server that the OTA update has been fully received and
+      15, // Client -> Server: Informs the server that the OTA update has been fully received and
           // checksum has been verified. (ready for reboot)
   BLUECHERRY_EVENT_TYPE_OTA_ERROR =
-      14, // Client -> Server: Informs the Server that an error occurred during the OTA update, and
+      16, // Client -> Server: Informs the Server that an error occurred during the OTA update, and
           // that the update should stop. Can be thrown at any time during the download, or at the
           // verification step. (Server will re-try ota up until max 3 times)
-  BLUECHERRY_EVENT_TYPE_INIT_INFO =
-      15 // Client -> Server: Sends initial information about the client to the server.
 } _bluecherry_event_type;
 
 /**
@@ -408,7 +411,7 @@ typedef enum {
  * @brief INIT_INFO payload layout.
  *
  * Mandatory core, 36 bytes:
- *   [0]       event type = 15
+ *   [0]       event type = 10
  *   [1]       schema version = 1
  *   [2..33]   running partition SHA-256
  *   [34..35]  presence bitmap, uint16 little endian
@@ -504,7 +507,8 @@ typedef enum {
   BLUECHERRY_OTA_STATE_OFFERED,           /* INITIALIZE received, waiting on the application */
   BLUECHERRY_OTA_STATE_DOWNLOADING,       /* START sent, chunks arriving */
   BLUECHERRY_OTA_STATE_AWAITING_VERIFIED, /* image written and hashed, VERIFIED queued */
-  BLUECHERRY_OTA_STATE_COMPLETE           /* verified, acked, boot partition set */
+  BLUECHERRY_OTA_STATE_COMPLETE,          /* verified, acked, boot partition set */
+  BLUECHERRY_OTA_STATE_RESUMING           /* reconnected mid-download, RESUME sent */
 } _bluecherry_ota_state;
 
 /**
@@ -519,7 +523,8 @@ typedef enum {
    * 3am is fine.
    *
    * Expect this event more than once: it is raised again every time the library
-   * reconnects to BlueCherry while the update is still on offer.
+   * reconnects to BlueCherry while the update is still on offer. A download that
+   * had already started resumes on reconnect without asking again.
    */
   BLUECHERRY_OTA_EVENT_AVAILABLE,
 
@@ -1038,6 +1043,11 @@ typedef struct {
    * server in START, VERIFIED and ERROR so it can tell which update we mean.
    */
   int8_t ota_target_version;
+
+  /**
+   * @brief True while a RESUME still has to be queued for the current session.
+   */
+  bool ota_resume_due;
 
   /**
    * @brief Priority slot for one outgoing internal-channel (topic 0x00) frame.

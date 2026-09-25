@@ -832,6 +832,7 @@ static void _bluecherry_ota_reset(void)
   _bluecherry_opdata.ota_buffer_pos = 0;
   _bluecherry_opdata.ota_target_version = 0;
   _bluecherry_opdata.ota_unverified = false;
+  _bluecherry_opdata.ota_resume_due = false;
   _bluecherry_opdata.ota_partition = NULL;
   memset(_bluecherry_opdata.ota_expected_hash, 0, BLUECHERRY_PARTITION_HASH_LEN);
 }
@@ -879,6 +880,53 @@ static void _bluecherry_ota_begin(void)
   ESP_LOGI(TAG, "OTA: requesting firmware v%d (%lu bytes)", _bluecherry_opdata.ota_target_version,
            _bluecherry_opdata.ota_size);
   _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_STARTED, 0);
+}
+
+/**
+ * @brief Keep an interrupted download so it can resume from what is on flash.
+ *
+ * Only a download that already received a chunk is kept, since only then had
+ * the cloud committed to it. The staged bytes are dropped: flash ends on a
+ * sector boundary while downloading, so the cloud resends from there.
+ *
+ * @return True when the download is kept, false when there is nothing to resume.
+ */
+static bool _bluecherry_ota_prepare_resume(void)
+{
+  if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_RESUMING &&
+     (_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_DOWNLOADING ||
+      _bluecherry_opdata.ota_progress + _bluecherry_opdata.ota_buffer_pos == 0)) {
+    return false;
+  }
+
+  _bluecherry_opdata.ota_buffer_pos = 0;
+  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_RESUMING;
+  _bluecherry_opdata.ota_resume_due = true;
+
+  ESP_LOGI(TAG, "OTA: resuming firmware v%d at %lu bytes", _bluecherry_opdata.ota_target_version,
+           _bluecherry_opdata.ota_progress);
+  return true;
+}
+
+/**
+ * @brief Tell the cloud how much of the interrupted download is already written.
+ *
+ * ota_resume_due stays set until the cloud acknowledges the RESUME.
+ */
+static void _bluecherry_ota_queue_resume(void)
+{
+  const uint32_t offset = _bluecherry_opdata.ota_progress;
+  uint8_t payload[6];
+  size_t n = 0;
+
+  payload[n++] = BLUECHERRY_EVENT_TYPE_OTA_RESUME;
+  payload[n++] = (uint8_t) _bluecherry_opdata.ota_target_version;
+  payload[n++] = offset & 0xFF;
+  payload[n++] = (offset >> 8) & 0xFF;
+  payload[n++] = (offset >> 16) & 0xFF;
+  payload[n++] = (offset >> 24) & 0xFF;
+
+  _bluecherry_publish_event(payload, (uint8_t) n);
 }
 
 /**
@@ -1219,8 +1267,11 @@ static void _bluecherry_ota_process_initialize(uint8_t* data, uint16_t len)
     return;
   }
 
-  if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_IDLE &&
-     _bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
+  if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_RESUMING) {
+    ESP_LOGI(TAG, "OTA: the cloud restarted the update");
+    _bluecherry_opdata.ota_resume_due = false;
+  } else if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_IDLE &&
+            _bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
     ESP_LOGW(TAG, "OTA: already busy, ignoring re-offer");
     return;
   }
@@ -1284,12 +1335,23 @@ static void _bluecherry_ota_process_initialize(uint8_t* data, uint16_t len)
  */
 static void _bluecherry_ota_process_chunk(uint8_t* data, uint16_t len)
 {
+  if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_RESUMING) {
+    /* Chunks the cloud sent before it got the RESUME belong to another offset. */
+    if(_bluecherry_opdata.ota_resume_due) {
+      ESP_LOGD(TAG, "OTA: chunk from before the resume, ignoring");
+      return;
+    }
+    ESP_LOGI(TAG, "OTA: download resumed at %lu bytes", _bluecherry_opdata.ota_progress);
+    _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_DOWNLOADING;
+  }
+
   if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_DOWNLOADING) {
     ESP_LOGW(TAG, "OTA: chunk outside a download, ignoring");
     return;
   }
 
-  if(len == 0 || _bluecherry_opdata.ota_progress + len > _bluecherry_opdata.ota_size) {
+  if(len == 0 || _bluecherry_opdata.ota_progress + _bluecherry_opdata.ota_buffer_pos + len >
+                     _bluecherry_opdata.ota_size) {
     ESP_LOGE(TAG, "OTA: chunk empty or beyond the announced size");
     _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_CHUNK_OVERRUN);
     return;
@@ -1356,6 +1418,14 @@ static void _bluecherry_process_event(uint8_t* data, uint8_t len)
 
   switch(data[0]) {
   case BLUECHERRY_EVENT_TYPE_OTA_PROBE: {
+    /* While resuming, the RESUME is the answer. */
+    if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_RESUMING) {
+      ESP_LOGD(TAG, "OTA probe from the cloud, answered with a resume");
+      _bluecherry_opdata.ota_resume_due = true;
+      _bluecherry_ota_queue_resume();
+      break;
+    }
+
     /* Answer it and touch no OTA state: the cloud has not yet been told what we
      * speak, and treating this as an offer would clobber a transfer that may
      * already be running. */
@@ -3065,13 +3135,12 @@ static esp_err_t _bluecherry_sync_once(void)
       _bluecherry_opdata.cur_message_id = 0;
       _bluecherry_opdata.last_acked_message_id = 0;
 
-      /* Abandon any transfer in progress. The server restarts an OTA from
-       * chunk 0 on a new session, so keeping ota_progress would resume writing
-       * at a stale offset and quietly corrupt the image - and unfixable any
-       * other way, because sequential chunks carry no offset to re-sync
-       * against. A protocol reply from the dead session is
-       * equally meaningless, so the priority slot goes with it. */
-      _bluecherry_ota_reset();
+      /* A download the cloud already sent chunks for is resumed, anything else in
+       * progress is dropped. A protocol reply from the dead session is meaningless,
+       * so the priority slot goes too. */
+      if(!_bluecherry_ota_prepare_resume()) {
+        _bluecherry_ota_reset();
+      }
       _bluecherry_opdata.pending_event_len = 0;
 
       /* Not IDLE: the INIT_INFO queued just below still has to go out. */
@@ -3080,6 +3149,11 @@ static esp_err_t _bluecherry_sync_once(void)
 
       /* Report the running image on every connect, not only at boot. */
       _bluecherry_send_init_info();
+
+      /* The RESUME goes out once the slot is free. */
+      if(_bluecherry_opdata.ota_resume_due && _bluecherry_opdata.pending_event_len == 0) {
+        _bluecherry_ota_queue_resume();
+      }
     } else {
       return ESP_ERR_NOT_FINISHED;
     }
@@ -3108,6 +3182,14 @@ static esp_err_t _bluecherry_sync_once(void)
       return ESP_ERR_NOT_FINISHED;
     }
     _bluecherry_opdata.pending_event_len = 0;
+
+    /* A RESUME is done once acknowledged. Anything else sent first leaves it due. */
+    if(ev.data[BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE] ==
+       BLUECHERRY_EVENT_TYPE_OTA_RESUME) {
+      _bluecherry_opdata.ota_resume_due = false;
+    } else if(_bluecherry_opdata.ota_resume_due) {
+      _bluecherry_ota_queue_resume();
+    }
 
     // rxtx only returns ESP_OK once the ACK is in, so this is where a VERIFIED
     // is known to have landed - and therefore the only safe point to make the
