@@ -65,6 +65,7 @@
 - feat(idf): ESP-IDF 6 support, and Kconfig selects the mbedtls options the library requires ([#20](https://github.com/bluecherry/bluecherry-esp-idf/pull/20))
 - feat(ZTP): provisioning moved into `bluecherry_sync`, so init no longer touches the network ([#17](https://github.com/bluecherry/bluecherry-esp-idf/pull/17))
 - example: wifi template restructured, network bring-up split out into `wifi.c` ([#19](https://github.com/bluecherry/bluecherry-esp-idf/pull/19))
+- feat(OTA): an interrupted download resumes after a reconnect instead of starting over ([#23](https://github.com/bluecherry/bluecherry-esp-idf/pull/23))
 
 ### Fixes
 
@@ -76,3 +77,6 @@
 - fix(sync): `IDLE` was reported before a cycle had finished, so an application sleeping on it could strand unsent data ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
 - fix(mbedtls): `CONFIG_MBEDTLS_SSL_PROTO_DTLS` is off by default in every ESP-IDF, producing a library that could not connect ([#20](https://github.com/bluecherry/bluecherry-esp-idf/pull/20))
 - fix(example): the NUL terminator was published, showing as a stray byte on the topic ([#20](https://github.com/bluecherry/bluecherry-esp-idf/pull/20))
+- fix(sync): bluecherry_publish and bluecherry_sync leave the state out of IDLE before they return ([#21](https://github.com/bluecherry/bluecherry-esp-idf/pull/21))
+- fix(CoAP): fewer retransmissions on slow links, at most 3 sends over about 30s, with a random factor that differs per device ([#22](https://github.com/bluecherry/bluecherry-esp-idf/pull/22))
+- fix(OTA): a surplus chunk fails the update with CHUNK_OVERRUN instead of stalling it ([#23](https://github.com/bluecherry/bluecherry-esp-idf/pull/23))
