@@ -521,9 +521,9 @@ typedef enum {
 /**
  * @brief A download the cloud has acknowledged that is not installed yet.
  *
- * Kept in RTC memory, so that a restart before bluecherry_ota_install can raise
- * BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE again. It only counts while sha256
- * still matches the image in the update slot.
+ * Kept in RTC memory, so that a deep sleep before bluecherry_ota_install can
+ * raise BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE again. Any other boot loses it.
+ * It only counts while sha256 still matches the image in the update slot.
  */
 typedef struct {
   /** @brief BLUECHERRY_OTA_READY_MAGIC while armed. */
@@ -601,9 +601,9 @@ typedef enum {
    * BLUECHERRY_OTA_EVENT_DOWNLOAD_AVAILABLE. Runs on the bc_sync task, so it must
    * not block.
    *
-   * A restart before the install raises this event again from bluecherry_init,
-   * on the task that called it. After a power loss the update is downloaded
-   * again instead.
+   * A deep sleep before the install raises this event again from
+   * bluecherry_init, on the task that called it. After any other restart the
+   * update is downloaded again instead.
    */
   BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE,
 
@@ -1170,7 +1170,7 @@ typedef struct {
  * fail because the cloud is unreachable.
  *
  * Before returning it raises BLUECHERRY_OTA_EVENT_FIRSTBOOT, and
- * BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE for a download a restart interrupted, so register the
+ * BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE for a download a deep sleep interrupted, so register the
  * OTA handler first.
  *
  * @param device_cert The BlueCherry device certificate in PEM format.

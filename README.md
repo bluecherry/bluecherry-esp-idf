@@ -138,6 +138,8 @@ from the handler means "I will decide this one" - which is how you defer a downl
 hour with `bluecherry_ota_start_download`, or keep running the current firmware until it is safe
 to call `bluecherry_ota_install` and restart. Returning `false`, or registering no handler at all,
 leaves the library to get on with it. `bluecherry_ota_abort` gives up on an update in progress.
+A download waiting for its install is kept across a deep sleep; any other restart discards it,
+and the update is downloaded again.
 
 With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, new firmware must be confirmed on its first boot or
 the bootloader rolls it back on the next restart. The library confirms it for you; a handler that

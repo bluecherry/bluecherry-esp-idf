@@ -154,26 +154,26 @@ static volatile uint8_t _ota_abort_code = 0;
 static volatile bool _ota_installed = false;
 
 /**
- * @brief Where state kept across restarts lives: RTC memory, which survives resets and deep sleep
- * but not a power loss. Chips without it use RAM that survives software resets only.
+ * @brief Where state kept across a deep sleep lives: RTC memory, which every other boot
+ * reinitialises. Chips without it keep nothing.
  */
 #if CONFIG_SOC_RTC_FAST_MEM_SUPPORTED || CONFIG_SOC_RTC_SLOW_MEM_SUPPORTED
-#define BLUECHERRY_RTC_ATTR RTC_NOINIT_ATTR
+#define BLUECHERRY_RTC_ATTR RTC_DATA_ATTR
 #else
-#define BLUECHERRY_RTC_ATTR __NOINIT_ATTR
+#define BLUECHERRY_RTC_ATTR
 #endif
 
 /**
- * @brief The download waiting for bluecherry_ota_install, kept across restarts.
+ * @brief The download waiting for bluecherry_ota_install, kept across a deep sleep.
  */
 static BLUECHERRY_RTC_ATTR _bluecherry_ota_ready_t _bluecherry_ota_ready;
 
 /**
  * @brief The image the cloud last acknowledged an INIT_INFO for, kept beside the download.
  *
- * INIT_INFO is only sent when this does not name the running image: after a power loss, which
- * loses the download too, or on a new image after an install, a rollback or a reflash. A soft
- * restart or a deep sleep sends none, so the cloud goes on waiting for the install.
+ * INIT_INFO is sent on every boot but a deep-sleep wake, so the cloud learns of every restart,
+ * crash and power loss, each of which also loses the download. After a deep sleep it is sent
+ * only on a new image, installed before the sleep.
  */
 static BLUECHERRY_RTC_ATTR _bluecherry_init_info_rtc_t _bluecherry_init_info;
 
@@ -1181,7 +1181,7 @@ static void _bluecherry_ota_check_boot(void)
 
   _bluecherry_ota_restore_held();
 
-  ESP_LOGI(TAG, "OTA: firmware v%d downloaded before the restart, not installed yet",
+  ESP_LOGI(TAG, "OTA: firmware v%d downloaded before the deep sleep, not installed yet",
            _bluecherry_opdata.ota_target_version);
 
   if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE, 0)) {
@@ -1296,8 +1296,8 @@ static void _bluecherry_init_info_acked(void)
  * @brief Queue INIT_INFO: the running partition hash plus optional details.
  *
  * Queued as the first thing a session carries, when the cloud lacks it for the running image:
- * after a power loss or on a new image, see _bluecherry_init_info. It is how the server learns
- * which image a device came up on, and so how an install is confirmed.
+ * on every boot but a deep-sleep wake, see _bluecherry_init_info. It is how the server learns
+ * that a device restarted and which image it came up on, and so how an install is confirmed.
  *
  * The hash is the part the cloud acts on. Everything behind the presence bitmap is
  * informational and the server never makes a decision on it.
