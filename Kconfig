@@ -1,13 +1,5 @@
 menu "BLUECHERRY Configuration"
 
-    config BLUECHERRY_AUTO_SYNC_SEC
-        int "Auto Sync Interval (seconds)"
-        default 10
-        range 1 3600
-        help
-            Set the interval in seconds for automatic synchronization when no messages are published.
-            Minimum is 1 second, maximum is 3600 seconds (1 hour).
-
     config BLUECHERRY_SYNC_TASK_STACK_SIZE
         int "Synchronisation Task Stack Size (bytes)"
         default 8192

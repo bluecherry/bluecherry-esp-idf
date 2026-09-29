@@ -111,19 +111,24 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
 /**
  * @brief Take the OTA decisions in the application instead of leaving them to the library.
  *
- * Exactly two events carry a decision, and this handler takes both of them explicitly so that
- * the two calls involved are visible and easy to move:
+ * Exactly three events carry a decision, and this handler takes all of them explicitly so that
+ * the calls involved are visible and easy to move:
  *
- *  - AVAILABLE: bluecherry_ota_start() accepts the update. Returning true means "I have this",
- *    so nothing is downloaded until that call is made - which is where you would instead stash
- *    the offer and start it at 3am, on battery power, or once your machine is idle.
- *  - COMPLETE: the new image is installed and the boot target is already set, so the only thing
- *    left is when to restart. Returning true means the library will not do it for you.
+ *  - DOWNLOAD_AVAILABLE: bluecherry_ota_start_download() accepts the update. Returning true
+ *    means "I have this", so nothing is downloaded until that call is made - which is where you
+ *    would instead stash the offer and start it at 3am, on battery power, or once your machine
+ *    is idle.
+ *  - DOWNLOAD_COMPLETE: the new image is downloaded and verified, but nothing boots it until
+ *    bluecherry_ota_install() is called. Returning true means the library will neither install
+ *    it nor restart for you.
+ *  - FIRSTBOOT: the new firmware is running for the first time, and the bootloader rolls it back
+ *    on the next restart unless bluecherry_ota_mark_valid() is called.
  *
- * Returning false from either event hands that decision back: the library downloads on offer
- * and restarts on install, which is what happens when no handler is registered at all. That is
- * the point of the return value - a handler that only logs is free to return false everywhere
- * and change nothing. The other three events are notifications and the return is ignored.
+ * Returning false from any of them hands that decision back: the library downloads on offer,
+ * installs and restarts once the download is complete, and marks new firmware valid on its first
+ * boot, which is what happens when no handler is registered at all. That is the point of the
+ * return value - a handler that only logs is free to return false everywhere and change nothing.
+ * The other three events are notifications and the return is ignored.
  *
  * @param event The OTA event.
  * @param info Details for the event, valid only for this call.
@@ -135,28 +140,36 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
                                    void* args)
 {
   switch(event) {
-  case BLUECHERRY_OTA_EVENT_AVAILABLE:
+  case BLUECHERRY_OTA_EVENT_DOWNLOAD_AVAILABLE:
     ESP_LOGI(TAG, "Firmware v%d available, %lu bytes - accepting", info->version, info->size);
     /* Accept now, or call this later to update when it suits you - there is no deadline, and
      * this event repeats on every reconnect while the update is on offer. */
-    bluecherry_ota_start();
+    bluecherry_ota_start_download();
     return true;
 
-  case BLUECHERRY_OTA_EVENT_STARTED:
+  case BLUECHERRY_OTA_EVENT_DOWNLOAD_STARTED:
     ESP_LOGI(TAG, "Firmware v%d downloading", info->version);
     break;
 
-  case BLUECHERRY_OTA_EVENT_PROGRESS:
+  case BLUECHERRY_OTA_EVENT_DOWNLOAD_PROGRESS:
     ESP_LOGI(TAG, "OTA progress %lu / %lu bytes (%lu%%)", info->bytes_received, info->size,
              info->size ? (unsigned long) ((uint64_t) info->bytes_received * 100 / info->size)
                         : 0UL);
     break;
 
-  case BLUECHERRY_OTA_EVENT_COMPLETE:
-    ESP_LOGI(TAG, "Firmware v%d installed - restarting", info->version);
-    /* The boot target is already set, so this is only about timing. Finish what your
-     * application is doing first if a restart here would interrupt it. */
+  case BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE:
+    ESP_LOGI(TAG, "Firmware v%d downloaded - installing and restarting", info->version);
+    /* Both calls can wait if a restart now would interrupt your application. The device keeps
+     * running this firmware until then. */
+    bluecherry_ota_install();
     esp_restart();
+    return true;
+
+  case BLUECHERRY_OTA_EVENT_FIRSTBOOT:
+    ESP_LOGI(TAG, "First boot of new firmware - keeping it");
+    /* Or confirm it later, once your application has checked it works, or call
+     * bluecherry_ota_rollback_restart() to return to the previous firmware. */
+    bluecherry_ota_mark_valid();
     return true;
 
   case BLUECHERRY_OTA_EVENT_FAILED:
@@ -276,13 +289,16 @@ void app_main(void)
   ESP_ERROR_CHECK(nvs_init());
   ESP_ERROR_CHECK(wifi_init());
 
-  /* Optional. This handler takes both OTA decisions itself so the calls are visible; drop it,
-   * or return false from those events, and the library downloads an offered update and reboots
-   * into it on its own. */
+  /* Optional. This handler takes the OTA decisions itself so the calls are visible; drop it, or
+   * return false from those events, and the library downloads an offered update, installs it and
+   * reboots into it on its own. Registered before init, which can raise OTA events itself. */
   bluecherry_set_ota_handler(bluecherry_ota_handler, NULL);
 
   /* Optional. Poll bluecherry_get_state() instead if you prefer. */
   bluecherry_set_state_handler(bluecherry_state_handler, NULL);
+
+  /* Optional. Without it incoming messages are acknowledged and discarded. */
+  bluecherry_set_msg_handler(bluecherry_msg_handler, NULL);
 
   /* Messages waiting to be published are kept here. Put it wherever you like and make it as
    * large as you need - PSRAM below, or pass NULL instead to let the library allocate it. */
@@ -292,21 +308,18 @@ void app_main(void)
 
   /* Zero-touch provisioning: the device asks BlueCherry for its own certificate and key on first
    * boot, using its MAC address to find the Walter it was registered as. Nothing to flash and
-   * nothing to keep track of - the handler above stores what it is issued. */
-  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE,
-                                      bluecherry_msg_handler, NULL, false, 30,
-                                      pub.buffer != NULL ? &pub : NULL));
+   * nothing to keep track of - the handler above stores what it is issued.
+   *
+   * Publishing schedules a synchronisation on its own; the 10 seconds is how long we go without
+   * one when there is nothing to send. Call bluecherry_set_auto_sync() at any time to change it.
+   * Passing 0 turns it off entirely: nothing is then sent or received until bluecherry_sync()
+   * is called. */
+  ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE, 10,
+                                      30, pub.buffer != NULL ? &pub : NULL));
 
   /* The alternative, for the rare device whose credentials were issued by hand and built into
    * the firmware. ZTP above is the normal way. */
-  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, bluecherry_msg_handler, NULL, false, 30,
-  //                                 pub.buffer != NULL ? &pub : NULL));
-
-  /* Publishing schedules a synchronisation on its own; the 10 seconds is how long we go without
-   * one when there is nothing to send. Call this again at any time to change the interval.
-   * Passing 0 turns it off entirely: nothing is then sent or received until bluecherry_sync()
-   * is called. */
-  bluecherry_set_auto_sync(10);
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, 10, 30, pub.buffer != NULL ? &pub : NULL));
 
   uint32_t counter = 0;
 

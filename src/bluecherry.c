@@ -147,6 +147,37 @@ static volatile bool _ota_abort_req = false;
 static volatile uint8_t _ota_abort_code = 0;
 
 /**
+ * @brief Set by bluecherry_ota_install until the restart.
+ *
+ * The update slot is then the boot target, so nothing may be downloaded into it.
+ */
+static volatile bool _ota_installed = false;
+
+/**
+ * @brief Where state kept across restarts lives: RTC memory, which survives resets and deep sleep
+ * but not a power loss. Chips without it use RAM that survives software resets only.
+ */
+#if CONFIG_SOC_RTC_FAST_MEM_SUPPORTED || CONFIG_SOC_RTC_SLOW_MEM_SUPPORTED
+#define BLUECHERRY_RTC_ATTR RTC_NOINIT_ATTR
+#else
+#define BLUECHERRY_RTC_ATTR __NOINIT_ATTR
+#endif
+
+/**
+ * @brief The download waiting for bluecherry_ota_install, kept across restarts.
+ */
+static BLUECHERRY_RTC_ATTR _bluecherry_ota_ready_t _bluecherry_ota_ready;
+
+/**
+ * @brief The image the cloud last acknowledged an INIT_INFO for, kept beside the download.
+ *
+ * INIT_INFO is only sent when this does not name the running image: after a power loss, which
+ * loses the download too, or on a new image after an install, a rollback or a reflash. A soft
+ * restart or a deep sleep sends none, so the cloud goes on waiting for the install.
+ */
+static BLUECHERRY_RTC_ATTR _bluecherry_init_info_rtc_t _bluecherry_init_info;
+
+/**
  * @brief Guards the connection state and the request flag below.
  *
  * A spinlock rather than a mutex, because what it protects is a decision immediately followed by
@@ -813,8 +844,34 @@ static bool _bluecherry_ota_flush(void)
 
   ESP_LOGD(TAG, "OTA: %lu / %lu bytes written (%.2f%%)", _bluecherry_opdata.ota_progress,
            _bluecherry_opdata.ota_size, _bluecherry_ota_progress_percent());
-  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_PROGRESS, 0);
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_PROGRESS, 0);
   return true;
+}
+
+/**
+ * @brief Whether a download is waiting for bluecherry_ota_install.
+ *
+ * @return True while _bluecherry_ota_ready is armed.
+ */
+static bool _bluecherry_ota_held(void)
+{
+  return _bluecherry_ota_ready.magic == BLUECHERRY_OTA_READY_MAGIC;
+}
+
+/**
+ * @brief Make the download waiting for its install the OTA state again.
+ *
+ * @return None.
+ */
+static void _bluecherry_ota_restore_held(void)
+{
+  _bluecherry_opdata.ota_partition = esp_ota_get_next_update_partition(NULL);
+  _bluecherry_opdata.ota_size = _bluecherry_ota_ready.size;
+  _bluecherry_opdata.ota_progress = _bluecherry_ota_ready.size;
+  _bluecherry_opdata.ota_target_version = _bluecherry_ota_ready.version;
+  memcpy(_bluecherry_opdata.ota_expected_hash, _bluecherry_ota_ready.sha256,
+         BLUECHERRY_PARTITION_HASH_LEN);
+  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_COMPLETE;
 }
 
 /**
@@ -823,6 +880,9 @@ static bool _bluecherry_ota_flush(void)
  * Every field describing an update goes, not just the transfer counters: a stale
  * ota_target_version or ota_unverified carried into the next offer would describe the previous
  * one, and ota_partition would be left pointing at a partition nothing is writing to.
+ *
+ * A download waiting for its install survives it, since nothing was writing its slot: the state
+ * returns to that download rather than to idle.
  */
 static void _bluecherry_ota_reset(void)
 {
@@ -835,10 +895,17 @@ static void _bluecherry_ota_reset(void)
   _bluecherry_opdata.ota_resume_due = false;
   _bluecherry_opdata.ota_partition = NULL;
   memset(_bluecherry_opdata.ota_expected_hash, 0, BLUECHERRY_PARTITION_HASH_LEN);
+
+  if(_bluecherry_ota_held()) {
+    _bluecherry_ota_restore_held();
+  }
 }
 
 /**
  * @brief Abandon the transfer, tell the cloud why, and inform the application.
+ *
+ * Failing the download waiting for its install gives that download up. Failing an offer made
+ * while one waits leaves the waiting one in place.
  */
 static void _bluecherry_ota_fail(uint8_t error_code)
 {
@@ -848,6 +915,11 @@ static void _bluecherry_ota_fail(uint8_t error_code)
                          (uint8_t) _bluecherry_opdata.ota_target_version, error_code };
   _bluecherry_publish_event(payload, sizeof(payload));
 
+  if(_bluecherry_ota_held() &&
+     _bluecherry_opdata.ota_target_version == _bluecherry_ota_ready.version) {
+    _bluecherry_ota_ready.magic = 0;
+  }
+
   _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_FAILED, error_code);
   _bluecherry_ota_reset();
 }
@@ -855,7 +927,7 @@ static void _bluecherry_ota_fail(uint8_t error_code)
 /**
  * @brief Accept the offered update and ask the server to start sending it.
  *
- * The body of bluecherry_ota_start, moved here so it runs on the synchronisation task: it
+ * The body of bluecherry_ota_start_download, moved here so it runs on the synchronisation task: it
  * writes the priority slot that the task transmits out of, and a second writer there can splice
  * a frame that is mid-flight across its retransmits.
  */
@@ -866,11 +938,21 @@ static void _bluecherry_ota_begin(void)
     ESP_LOGW(TAG, "OTA: the offer was withdrawn before the update could start");
     return;
   }
+  if(_ota_installed) {
+    ESP_LOGW(TAG, "OTA: an update is installed, restart before starting another");
+    return;
+  }
 
   uint8_t payload[2] = { BLUECHERRY_EVENT_TYPE_OTA_START,
                          (uint8_t) _bluecherry_opdata.ota_target_version };
   if(_bluecherry_publish_event(payload, sizeof(payload)) != ESP_OK) {
     return;
+  }
+
+  /* The new download overwrites the slot, so this is where a waiting one is given up. */
+  if(_bluecherry_ota_held()) {
+    ESP_LOGI(TAG, "OTA: discarding the downloaded firmware v%d", _bluecherry_ota_ready.version);
+    _bluecherry_ota_ready.magic = 0;
   }
 
   _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_DOWNLOADING;
@@ -879,7 +961,7 @@ static void _bluecherry_ota_begin(void)
 
   ESP_LOGI(TAG, "OTA: requesting firmware v%d (%lu bytes)", _bluecherry_opdata.ota_target_version,
            _bluecherry_opdata.ota_size);
-  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_STARTED, 0);
+  _bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_STARTED, 0);
 }
 
 /**
@@ -930,7 +1012,7 @@ static void _bluecherry_ota_queue_resume(void)
 }
 
 /**
- * @brief Carry out whatever bluecherry_ota_start or bluecherry_ota_abort asked for.
+ * @brief Carry out whatever bluecherry_ota_start_download or bluecherry_ota_abort asked for.
  *
  * Run before the send step, so the resulting event goes out in the same cycle.
  */
@@ -958,10 +1040,11 @@ static void _bluecherry_ota_service_requests(void)
  *   2. hash the partition and compare     -> mismatch: report and give up
  *   3. send VERIFIED                      -> committed only once acked
  *
- * The boot partition is NOT set here but in _bluecherry_ota_commit, once the
- * server has acknowledged the VERIFIED, so an unexpected reset in between boots
- * the OLD image and the server simply retries. Committing first is what lets a
- * device reboot into firmware the cloud never learned about.
+ * The boot partition is NOT set here but in bluecherry_ota_install, which only
+ * accepts an image _bluecherry_ota_commit has seen the server acknowledge, so an
+ * unexpected reset in between boots the OLD image and the server simply retries.
+ * Committing first is what lets a device reboot into firmware the cloud never
+ * learned about.
  *
  * The hash is read back from flash rather than accumulated over the arriving
  * bytes, so it attests to what is actually stored, and it is exactly the
@@ -1020,35 +1103,89 @@ static void _bluecherry_ota_verify(void)
     return;
   }
 
+  /* Armed by _bluecherry_ota_commit, once the cloud has acknowledged this hash. */
+  memcpy(_bluecherry_ota_ready.sha256, actual, BLUECHERRY_PARTITION_HASH_LEN);
+
   _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_AWAITING_VERIFIED;
   ESP_LOGI(TAG, "OTA: image verified, reporting to the cloud before committing");
 }
 
 /**
- * @brief Commit the new image once the cloud has acknowledged the VERIFIED.
+ * @brief The library's own answer to BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE.
+ */
+static void _bluecherry_ota_install_and_restart(void)
+{
+  if(bluecherry_ota_install() == ESP_OK) {
+    ESP_LOGI(TAG, "OTA: rebooting into the new firmware");
+    esp_restart();
+  }
+}
+
+/**
+ * @brief Accept the new image once the cloud has acknowledged the VERIFIED.
  *
  * Called from the send step, which knows the message was acknowledged because
- * _bluecherry_coap_rxtx only returns ESP_OK on an ACK. This is the single
- * irreversible step in the whole flow.
+ * _bluecherry_coap_rxtx only returns ESP_OK on an ACK. Nothing is bootable yet:
+ * the single irreversible step is bluecherry_ota_install, which only accepts an
+ * image that got this far.
  */
 static void _bluecherry_ota_commit(void)
 {
-  if(esp_ota_set_boot_partition(_bluecherry_opdata.ota_partition) != ESP_OK) {
-    ESP_LOGE(TAG, "OTA: could not set the boot partition");
-    _bluecherry_ota_fail(BLUECHERRY_OTA_ERR_SET_BOOT_FAILED);
+  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_COMPLETE;
+
+  _bluecherry_ota_ready.size = _bluecherry_opdata.ota_size;
+  _bluecherry_ota_ready.version = _bluecherry_opdata.ota_target_version;
+  _bluecherry_ota_ready.magic = BLUECHERRY_OTA_READY_MAGIC;
+
+  ESP_LOGI(TAG, "OTA: firmware v%d downloaded and acknowledged",
+           _bluecherry_opdata.ota_target_version);
+
+  /* Nobody watching, or watching without taking the decision: install and
+   * reboot now. An application that says it owns the moment keeps running the
+   * old firmware until it installs and reboots, which is the point of saying so. */
+  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE, 0)) {
+    _bluecherry_ota_install_and_restart();
+  }
+}
+
+/**
+ * @brief Raise the OTA events that belong to this boot rather than to a session.
+ *
+ * Runs on the caller of bluecherry_init before anything is reserved, so a
+ * default install restarts the device without having started anything.
+ */
+static void _bluecherry_ota_check_boot(void)
+{
+  esp_ota_img_states_t img_state;
+  if(esp_ota_get_state_partition(esp_ota_get_running_partition(), &img_state) == ESP_OK &&
+     img_state == ESP_OTA_IMG_PENDING_VERIFY) {
+    ESP_LOGI(TAG, "OTA: first boot of new firmware");
+    if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_FIRSTBOOT, 0)) {
+      bluecherry_ota_mark_valid();
+    }
+  }
+
+  if(_bluecherry_ota_ready.magic != BLUECHERRY_OTA_READY_MAGIC) {
     return;
   }
 
-  _bluecherry_opdata.ota_state = BLUECHERRY_OTA_STATE_COMPLETE;
-  ESP_LOGI(TAG, "OTA: firmware v%d installed and acknowledged; boot partition set",
+  /* The magic alone is not enough: the slot may have been rewritten since. */
+  const esp_partition_t* part = esp_ota_get_next_update_partition(NULL);
+  uint8_t actual[BLUECHERRY_PARTITION_HASH_LEN];
+  if(part == NULL || esp_partition_get_sha256(part, actual) != ESP_OK ||
+     memcmp(actual, _bluecherry_ota_ready.sha256, BLUECHERRY_PARTITION_HASH_LEN) != 0) {
+    ESP_LOGW(TAG, "OTA: the downloaded image is no longer in the update slot, discarding it");
+    _bluecherry_ota_ready.magic = 0;
+    return;
+  }
+
+  _bluecherry_ota_restore_held();
+
+  ESP_LOGI(TAG, "OTA: firmware v%d downloaded before the restart, not installed yet",
            _bluecherry_opdata.ota_target_version);
 
-  /* Nobody watching, or watching without taking the decision: reboot now. An
-   * application that says it owns the moment keeps running the old firmware
-   * until it reboots, which is the point of saying so. */
-  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_COMPLETE, 0)) {
-    ESP_LOGI(TAG, "OTA: rebooting into the new firmware");
-    esp_restart();
+  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE, 0)) {
+    _bluecherry_ota_install_and_restart();
   }
 }
 
@@ -1132,14 +1269,35 @@ static bool _bluecherry_info_add_str(uint8_t* buf, size_t cap, size_t* n, const 
 }
 
 /**
+ * @brief Whether the cloud already has the INIT_INFO for the running image.
+ *
+ * @return True when _bluecherry_init_info names the running image.
+ */
+static bool _bluecherry_init_info_known(void)
+{
+  return _bluecherry_init_info.magic == BLUECHERRY_INIT_INFO_MAGIC &&
+         memcmp(_bluecherry_init_info.app_elf_sha256, esp_app_get_description()->app_elf_sha256,
+                sizeof(_bluecherry_init_info.app_elf_sha256)) == 0;
+}
+
+/**
+ * @brief Record that the cloud has acknowledged the INIT_INFO for the running image.
+ *
+ * @return None.
+ */
+static void _bluecherry_init_info_acked(void)
+{
+  memcpy(_bluecherry_init_info.app_elf_sha256, esp_app_get_description()->app_elf_sha256,
+         sizeof(_bluecherry_init_info.app_elf_sha256));
+  _bluecherry_init_info.magic = BLUECHERRY_INIT_INFO_MAGIC;
+}
+
+/**
  * @brief Queue INIT_INFO: the running partition hash plus optional details.
  *
- * Queued from bluecherry_sync, on every connect, as the first thing the new session carries.
- * The contents cannot change while the device runs, but the server tracks this per session:
- * it is how a reconnecting device re-identifies the image it is running, and how a reboot
- * into new firmware is confirmed. Re-sending is therefore not redundant - the priority slot
- * is cleared on reconnect precisely because a reply owed to the dead session is meaningless,
- * and this is queued straight after.
+ * Queued as the first thing a session carries, when the cloud lacks it for the running image:
+ * after a power loss or on a new image, see _bluecherry_init_info. It is how the server learns
+ * which image a device came up on, and so how an install is confirmed.
  *
  * The hash is the part the cloud acts on. Everything behind the presence bitmap is
  * informational and the server never makes a decision on it.
@@ -1267,11 +1425,25 @@ static void _bluecherry_ota_process_initialize(uint8_t* data, uint16_t len)
     return;
   }
 
+  if(_ota_installed) {
+    ESP_LOGI(TAG, "OTA: an update is installed, offers wait for the restart");
+    return;
+  }
+
+  /* A download waiting for its install is not offered twice. Any other version is offered as
+   * usual, and the waiting one stays installable until that one is started. */
+  if(_bluecherry_ota_held() && (int8_t) data[0] == _bluecherry_ota_ready.version) {
+    ESP_LOGI(TAG, "OTA: firmware v%d is already downloaded, waiting for its install",
+             _bluecherry_ota_ready.version);
+    return;
+  }
+
   if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_RESUMING) {
     ESP_LOGI(TAG, "OTA: the cloud restarted the update");
     _bluecherry_opdata.ota_resume_due = false;
   } else if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_IDLE &&
-            _bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
+            _bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED &&
+            _bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_COMPLETE) {
     ESP_LOGW(TAG, "OTA: already busy, ignoring re-offer");
     return;
   }
@@ -1318,8 +1490,8 @@ static void _bluecherry_ota_process_initialize(uint8_t* data, uint16_t len)
   /* Nobody watching, or watching without taking the decision: start now. An
    * application only gets to choose the moment by saying so, so forgetting to
    * decide cannot leave a device sitting on an update forever. */
-  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_AVAILABLE, 0)) {
-    bluecherry_ota_start();
+  if(!_bluecherry_ota_notify(BLUECHERRY_OTA_EVENT_DOWNLOAD_AVAILABLE, 0)) {
+    bluecherry_ota_start_download();
   }
 }
 
@@ -2922,28 +3094,23 @@ fail:
 /**
  * @brief Reserve everything both entry points need, without touching the network.
  *
- * Reserves the publish buffer, sets up the Mbed TLS contexts and the CA chain, configures the
- * watchdog and starts the synchronisation task. The caller supplies the state to settle in,
- * which is the only thing that differs between a pre-provisioned device and one that still has
- * to be provisioned.
+ * Raises the OTA events that belong to this boot, then reserves the publish buffer, sets up the
+ * Mbed TLS contexts and the CA chain, configures the watchdog and starts the synchronisation
+ * task. The caller supplies the state to settle in, which is the only thing that differs between
+ * a pre-provisioned device and one that still has to be provisioned.
  *
- * @param msg_handler The message handler or NULL to ignore incoming messages.
- * @param msg_handler_args Optional user arguments to pass to the message handler.
- * @param auto_sync True to spawn the automatic synchronisation task.
+ * @param interval_sec Seconds between automatic synchronisations, or 0 for none.
  * @param watchdog_timeout_seconds The task watchdog timeout in seconds, or 0 to leave it alone.
  * @param publish_buffer The application's publish buffer, or NULL to allocate one.
  * @param initial_state The state to leave the library in on success.
  *
  * @return ESP_OK on success, ESP_FAIL otherwise.
  */
-static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
-                                         void* msg_handler_args, bool auto_sync,
-                                         uint16_t watchdog_timeout_seconds,
+static esp_err_t _bluecherry_init_common(uint32_t interval_sec, uint16_t watchdog_timeout_seconds,
                                          const bluecherry_publish_buffer_t* publish_buffer,
                                          bluecherry_state initial_state)
 {
-  _bluecherry_opdata.msg_handler = msg_handler;
-  _bluecherry_opdata.msg_handler_args = msg_handler_args;
+  _bluecherry_ota_check_boot();
 
   uint8_t mac[6];
   esp_err_t eret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -2980,8 +3147,8 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
   }
 
   /* INIT_INFO is deliberately NOT queued here. bluecherry_sync clears the priority slot on
-   * every connect and refills it with a fresh INIT_INFO, so anything queued before the first
-   * session would be discarded unsent. */
+   * every connect and queues it there, so anything queued before the first session would be
+   * discarded unsent. */
 
   /* Started unconditionally: bluecherry_sync is a trigger, so the task has to exist even when
    * the application drives synchronisation itself. Guarded on the handle so a retried init
@@ -2998,10 +3165,8 @@ static esp_err_t _bluecherry_init_common(bluecherry_msg_handler_t msg_handler,
     }
   }
 
-  if(auto_sync) {
-    ESP_LOGW(TAG, "the auto_sync argument is deprecated, "
-                  "call bluecherry_set_auto_sync(seconds) instead");
-    bluecherry_set_auto_sync(CONFIG_BLUECHERRY_AUTO_SYNC_SEC);
+  if(interval_sec > 0) {
+    bluecherry_set_auto_sync(interval_sec);
   }
 
   _bluecherry_set_state(initial_state);
@@ -3019,9 +3184,8 @@ fail:
   return ESP_FAIL;
 }
 
-esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
-                          bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                          bool auto_sync, uint16_t watchdog_timeout_seconds,
+esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint32_t interval_sec,
+                          uint16_t watchdog_timeout_seconds,
                           const bluecherry_publish_buffer_t* publish_buffer)
 {
   if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED)
@@ -3032,9 +3196,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t ret =
-      _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
-                              publish_buffer, BLUECHERRY_STATE_AWAIT_CONNECTION);
+  esp_err_t ret = _bluecherry_init_common(interval_sec, watchdog_timeout_seconds, publish_buffer,
+                                          BLUECHERRY_STATE_AWAIT_CONNECTION);
   if(ret != ESP_OK) {
     return ret;
   }
@@ -3050,8 +3213,7 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
 
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
                               void* ztp_bio_handler_args, const char* bc_device_type,
-                              bluecherry_msg_handler_t msg_handler, void* msg_handler_args,
-                              bool auto_sync, uint16_t watchdog_timeout_seconds,
+                              uint32_t interval_sec, uint16_t watchdog_timeout_seconds,
                               const bluecherry_publish_buffer_t* publish_buffer)
 {
   if(_bluecherry_opdata.state != BLUECHERRY_STATE_UNINITIALIZED) {
@@ -3070,8 +3232,8 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
   /* Nothing here talks to the network. Reading the stored credentials and, if there are none,
    * provisioning this device both happen on the first bluecherry_sync - so this call cannot
    * fail because the cloud is unreachable, and the caller does not have to retry it. */
-  return _bluecherry_init_common(msg_handler, msg_handler_args, auto_sync, watchdog_timeout_seconds,
-                                 publish_buffer, BLUECHERRY_STATE_NOT_PROVISIONED);
+  return _bluecherry_init_common(interval_sec, watchdog_timeout_seconds, publish_buffer,
+                                 BLUECHERRY_STATE_NOT_PROVISIONED);
 }
 
 /**
@@ -3136,19 +3298,22 @@ static esp_err_t _bluecherry_sync_once(void)
       _bluecherry_opdata.last_acked_message_id = 0;
 
       /* A download the cloud already sent chunks for is resumed, anything else in
-       * progress is dropped. A protocol reply from the dead session is meaningless,
-       * so the priority slot goes too. */
+       * progress is dropped, and one waiting for its install is kept by the reset. A
+       * protocol reply from the dead session is meaningless, so the priority slot goes
+       * too. */
       if(!_bluecherry_ota_prepare_resume()) {
         _bluecherry_ota_reset();
       }
       _bluecherry_opdata.pending_event_len = 0;
 
-      /* Not IDLE: the INIT_INFO queued just below still has to go out. */
+      /* Not IDLE: the new session still has to run this cycle's exchange. */
       _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
       retry_interval_ms = 100;
 
-      /* Report the running image on every connect, not only at boot. */
-      _bluecherry_send_init_info();
+      /* Only when the cloud lacks it for the running image, see _bluecherry_init_info. */
+      if(!_bluecherry_init_info_known()) {
+        _bluecherry_send_init_info();
+      }
 
       /* The RESUME goes out once the slot is free. */
       if(_bluecherry_opdata.ota_resume_due && _bluecherry_opdata.pending_event_len == 0) {
@@ -3181,6 +3346,13 @@ static esp_err_t _bluecherry_sync_once(void)
       _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
       return ESP_ERR_NOT_FINISHED;
     }
+
+    /* ESP_OK is the ACK, so the server now has the INIT_INFO for the running image. */
+    if(ev.data[BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE] ==
+       BLUECHERRY_EVENT_TYPE_INIT_INFO) {
+      _bluecherry_init_info_acked();
+    }
+
     _bluecherry_opdata.pending_event_len = 0;
 
     /* A RESUME is done once acknowledged. Anything else sent first leaves it due. */
@@ -3192,8 +3364,8 @@ static esp_err_t _bluecherry_sync_once(void)
     }
 
     // rxtx only returns ESP_OK once the ACK is in, so this is where a VERIFIED
-    // is known to have landed - and therefore the only safe point to make the
-    // new image the boot target.
+    // is known to have landed - and therefore the only safe point to offer the
+    // new image for install.
     if(_bluecherry_opdata.ota_state == BLUECHERRY_OTA_STATE_AWAITING_VERIFIED) {
       _bluecherry_ota_commit();
     }
@@ -3357,18 +3529,49 @@ esp_err_t bluecherry_set_ota_handler(bluecherry_ota_handler_t handler, void* arg
   return ESP_OK;
 }
 
-esp_err_t bluecherry_ota_start(void)
+esp_err_t bluecherry_ota_start_download(void)
 {
   /* Advisory: the application may be on any task, and the offer could be withdrawn between this
    * check and the request being serviced. The task re-checks before acting. Answering here
    * anyway keeps the return value meaning what it always did. */
-  if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED) {
-    ESP_LOGW(TAG, "bluecherry_ota_start: no update is on offer");
+  if(_bluecherry_opdata.ota_state != BLUECHERRY_OTA_STATE_OFFERED || _ota_installed) {
+    ESP_LOGW(TAG, "bluecherry_ota_start_download: no update is on offer");
     return ESP_ERR_INVALID_STATE;
   }
 
   _ota_start_req = true;
   return bluecherry_sync();
+}
+
+esp_err_t bluecherry_ota_install(void)
+{
+  /* Nothing may be writing the slot. A newer update merely on offer writes nothing until it is
+   * started, so the waiting download stays installable until then. */
+  const _bluecherry_ota_state state = _bluecherry_opdata.ota_state;
+  if(!_bluecherry_ota_held() ||
+     (state != BLUECHERRY_OTA_STATE_COMPLETE && state != BLUECHERRY_OTA_STATE_OFFERED)) {
+    ESP_LOGW(TAG, "bluecherry_ota_install: no download is waiting for its install");
+    return ESP_ERR_INVALID_STATE;
+  }
+  const int8_t version = _bluecherry_ota_ready.version;
+
+  /* Disarmed before the boot target is set, so an installed image is never offered again, not
+   * even after a rollback to the firmware running now. */
+  _bluecherry_ota_ready.magic = 0;
+
+  esp_err_t err = esp_ota_set_boot_partition(esp_ota_get_next_update_partition(NULL));
+  if(err != ESP_OK) {
+    ESP_LOGE(TAG, "OTA: could not set the boot partition");
+    /* The cloud waits for this install only while no newer update is on offer. */
+    if(state == BLUECHERRY_OTA_STATE_COMPLETE) {
+      bluecherry_ota_abort(BLUECHERRY_OTA_ERR_SET_BOOT_FAILED);
+    }
+    return err;
+  }
+
+  _ota_installed = true;
+  ESP_LOGI(TAG, "OTA: firmware v%d installed, it boots on the next restart", version);
+  return ESP_OK;
 }
 
 esp_err_t bluecherry_ota_abort(uint8_t error_code)
@@ -3380,6 +3583,21 @@ esp_err_t bluecherry_ota_abort(uint8_t error_code)
   _ota_abort_code = error_code;
   _ota_abort_req = true;
   return bluecherry_sync();
+}
+
+esp_err_t bluecherry_ota_mark_valid(void)
+{
+  esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if(err == ESP_OK) {
+    ESP_LOGI(TAG, "OTA: running firmware marked valid");
+  }
+  return err;
+}
+
+esp_err_t bluecherry_ota_rollback_restart(void)
+{
+  ESP_LOGW(TAG, "OTA: rolling back to the previous firmware");
+  return esp_ota_mark_app_invalid_rollback_and_reboot();
 }
 
 esp_err_t bluecherry_sync(void)
@@ -3432,6 +3650,13 @@ esp_err_t bluecherry_set_state_handler(bluecherry_state_handler_t handler, void*
 {
   _bluecherry_opdata.state_handler_args = args;
   _bluecherry_opdata.state_handler = handler;
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_set_msg_handler(bluecherry_msg_handler_t handler, void* args)
+{
+  _bluecherry_opdata.msg_handler_args = args;
+  _bluecherry_opdata.msg_handler = handler;
   return ESP_OK;
 }
 
