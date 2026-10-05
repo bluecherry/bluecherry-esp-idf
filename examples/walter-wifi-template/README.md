@@ -1,4 +1,4 @@
-# BlueCherry WiFi template
+# BlueCherry WiFi template for Walter
 
 ## Introduction
 
@@ -12,9 +12,16 @@ communication. It demonstrates:
 
 ## Hardware
 
-Any ESP32-S3 with at least 4 MB of flash. On a Walter board, use
-[walter-wifi-template](../walter-wifi-template) instead, which puts its 16 MB of flash and its PSRAM
-to use.
+A Walter board. This is the same application as [wifi-template](../wifi-template), set up to use
+what Walter has on board:
+
+ - **PSRAM**: the publish buffer is allocated there, leaving internal RAM to the application.
+ - **16 MB of flash**: two OTA slots of just under 4 MB each, and an 8 MB LittleFS partition that
+   this example does not use, reserved for the application's own files. Its `littlefs` subtype
+   needs ESP-IDF 5.2 or later, so this example does too.
+
+It connects over the ESP32-S3's WiFi, not Walter's cellular modem. For cellular, use the
+BlueCherry client in the `dptechnics/walter-modem` component.
 
 ## Layout
 
