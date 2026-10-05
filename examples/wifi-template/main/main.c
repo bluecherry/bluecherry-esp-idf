@@ -23,7 +23,6 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <sdkconfig.h>
 #include <nvs_flash.h>
@@ -301,10 +300,9 @@ void app_main(void)
   bluecherry_set_msg_handler(bluecherry_msg_handler, NULL);
 
   /* Messages waiting to be published are kept here. Put it wherever you like and make it as
-   * large as you need - PSRAM below, or pass NULL instead to let the library allocate it. */
-  bluecherry_publish_buffer_t pub = { .buffer =
-                                          heap_caps_malloc(PUBLISH_BUFFER_SIZE, MALLOC_CAP_SPIRAM),
-                                      .size = PUBLISH_BUFFER_SIZE };
+   * large as you need - a static array below, or pass NULL to let the library allocate it. */
+  static uint8_t publish_buffer[PUBLISH_BUFFER_SIZE];
+  bluecherry_publish_buffer_t pub = { .buffer = publish_buffer, .size = PUBLISH_BUFFER_SIZE };
 
   /* Zero-touch provisioning: the device asks BlueCherry for its own certificate and key on first
    * boot, using its MAC address to find the Walter it was registered as. Nothing to flash and
@@ -315,11 +313,11 @@ void app_main(void)
    * Passing 0 turns it off entirely: nothing is then sent or received until bluecherry_sync()
    * is called. */
   ESP_ERROR_CHECK(bluecherry_init_ztp(bluecherry_ztp_bio_handler, NULL, BLUECHERRY_DEVICE_TYPE, 10,
-                                      30, pub.buffer != NULL ? &pub : NULL));
+                                      30, &pub));
 
   /* The alternative, for the rare device whose credentials were issued by hand and built into
    * the firmware. ZTP above is the normal way. */
-  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, 10, 30, pub.buffer != NULL ? &pub : NULL));
+  // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, 10, 30, &pub));
 
   uint32_t counter = 0;
 
