@@ -97,11 +97,12 @@ calls, and use `bluecherry_set_auto_sync` to change the interval at runtime.
 Nothing is dropped to make room: a message stays in the buffer until the cloud acknowledges it, so
 `bluecherry_publish` returns `ESP_ERR_NO_MEM` once the buffer is full and the connection is not
 keeping up. Pass a `bluecherry_publish_buffer_t` to `bluecherry_init` to decide how much room that
-is and where it comes from - PSRAM, say, or memory your application reserved itself:
+is and where it comes from - a static array, say, or PSRAM on a board that has it:
 
 ```c
-bluecherry_publish_buffer_t pub = { .buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM),
-                                    .size = 8192 };
+static uint8_t pub_buf[8192];
+
+bluecherry_publish_buffer_t pub = { .buffer = pub_buf, .size = sizeof(pub_buf) };
 bluecherry_init(device_cert, device_key, 10, 60, &pub);
 ```
 
