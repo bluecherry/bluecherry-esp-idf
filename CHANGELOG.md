@@ -52,7 +52,8 @@
 ### Breaking changes
 
 - `bluecherry_sync` takes no argument and returns once the sync task is signalled, not once the exchange completed ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
-- `bluecherry_init` and `bluecherry_init_ztp` take a publish buffer argument; `auto_sync` is deprecated in favour of `bluecherry_set_auto_sync` ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
+- `bluecherry_init` and `bluecherry_init_ztp` take a publish buffer argument ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
+- `bluecherry_init` and `bluecherry_init_ztp` take the auto-sync interval in seconds in place of `auto_sync`, and no longer take the message handler, which moved to `bluecherry_set_msg_handler`; `CONFIG_BLUECHERRY_AUTO_SYNC_SEC` is removed ([#24](https://github.com/bluecherry/bluecherry-esp-idf/pull/24))
 - `CONFIG_BLUECHERRY_MAX_PENDING_OUTGOING_MESSAGES` replaced by `CONFIG_BLUECHERRY_PUBLISH_BUFFER_SIZE`, bounded in bytes instead of messages ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
 - `bluecherry_sync` returns `ESP_ERR_NOT_FINISHED` while provisioning or backing off ([#17](https://github.com/bluecherry/bluecherry-esp-idf/pull/17))
 - minimum supported ESP-IDF is now 5.0 ([#20](https://github.com/bluecherry/bluecherry-esp-idf/pull/20))
@@ -60,12 +61,13 @@
 ### Features
 
 - feat(OTA): reworked OTA protocol, the application decides when to download and when to reboot ([#16](https://github.com/bluecherry/bluecherry-esp-idf/pull/16))
-- feat(sync): asynchronous sync, runtime auto-sync and a caller-owned publish buffer ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
+- feat(sync): asynchronous sync, runtime auto-sync and a caller-owned publish buffer, placed and sized as the application needs ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18), [#25](https://github.com/bluecherry/bluecherry-esp-idf/pull/25))
 - feat(state): `bluecherry_get_state` and `bluecherry_set_state_handler`, and `IDLE` now means safe to sleep ([#18](https://github.com/bluecherry/bluecherry-esp-idf/pull/18))
 - feat(idf): ESP-IDF 6 support, and Kconfig selects the mbedtls options the library requires ([#20](https://github.com/bluecherry/bluecherry-esp-idf/pull/20))
 - feat(ZTP): provisioning moved into `bluecherry_sync`, so init no longer touches the network ([#17](https://github.com/bluecherry/bluecherry-esp-idf/pull/17))
 - example: wifi template restructured, network bring-up split out into `wifi.c` ([#19](https://github.com/bluecherry/bluecherry-esp-idf/pull/19))
 - feat(OTA): an interrupted download resumes after a reconnect instead of starting over ([#23](https://github.com/bluecherry/bluecherry-esp-idf/pull/23))
+- feat(OTA): install on demand and confirm on first boot; `bluecherry_init` takes the sync interval ([#24](https://github.com/bluecherry/bluecherry-esp-idf/pull/24))
 
 ### Fixes
 
