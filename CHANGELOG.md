@@ -68,6 +68,7 @@
 - example: wifi template restructured, network bring-up split out into `wifi.c` ([#19](https://github.com/bluecherry/bluecherry-esp-idf/pull/19))
 - feat(OTA): an interrupted download resumes after a reconnect instead of starting over ([#23](https://github.com/bluecherry/bluecherry-esp-idf/pull/23))
 - feat(OTA): install on demand and confirm on first boot; `bluecherry_init` takes the sync interval ([#24](https://github.com/bluecherry/bluecherry-esp-idf/pull/24))
+- example: `walter-wifi-template`, the wifi template set up for Walter's 16 MB of flash with a LittleFS partition for the application; needs ESP-IDF 5.2 ([#26](https://github.com/bluecherry/bluecherry-esp-idf/pull/26))
 
 ### Fixes
 
