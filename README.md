@@ -58,7 +58,7 @@ the `idf_components.yml` file inside the `main` folder of your project:
 ```yml
 dependencies:
   bluecherry/bluecherry:
-    version: ">=1.3.4"
+    version: ">=1.4.0"
 ```
 
 ### Connect to the platform
@@ -94,6 +94,10 @@ returns. A background task talks to the cloud, at least every interval given to 
 and as soon as something is published. Pass `0` to leave the timing to your own `bluecherry_sync`
 calls, and use `bluecherry_set_auto_sync` to change the interval at runtime.
 
+`bluecherry_sync` only signals that task and returns; it does not wait for the exchange. To know
+that a message has actually left, wait for `BLUECHERRY_STATE_IDLE` through `bluecherry_get_state`
+or `bluecherry_set_state_handler` - which is also the moment it is safe to sleep.
+
 Nothing is dropped to make room: a message stays in the buffer until the cloud acknowledges it, so
 `bluecherry_publish` returns `ESP_ERR_NO_MEM` once the buffer is full and the connection is not
 keeping up. Pass a `bluecherry_publish_buffer_t` to `bluecherry_init` to decide how much room that
@@ -125,7 +129,7 @@ paid cellular plains this is a huge win.
 ## Licence 
 
 The library is published under the 'GNU LESSER GENERAL PUBLIC LICENSE'. The full license text can 
-be read [here](license.md).
+be read [here](LICENSE.md).
 
 ## Over-the-air updates
 
