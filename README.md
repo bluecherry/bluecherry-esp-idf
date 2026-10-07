@@ -151,8 +151,37 @@ the bootloader rolls it back on the next restart. The library confirms it for yo
 takes `BLUECHERRY_OTA_EVENT_FIRSTBOOT` calls `bluecherry_ota_mark_valid` itself once it is
 satisfied, or `bluecherry_ota_rollback_restart` to return to the previous firmware.
 
+## Topic mappings
+
+A topic byte is only a number until the cloud maps it to an MQTT topic, and a device can read that
+map and manage its own half of it.
+
+`bluecherry_topic_map_get` lists the mappings, `bluecherry_topic_map_set` creates or replaces one
+and `bluecherry_topic_map_delete` removes one. All three are asynchronous: register a handler with
+`bluecherry_set_topic_map_handler` first, because without one the answers are parsed and dropped.
+The library caches nothing, so each mapping is reported as it arrives and is valid only for the
+duration of the call.
+
+A mapping is identified by its **direction and topic byte**, never by the topic string. Uplink and
+downlink are separate maps with independent byte spaces, so byte `0x25` can publish to
+`/test2test` and receive on `/test2test-downlink` at the same time. There is no combined
+direction: using one byte both ways is two calls.
+
+A device sets only the part of the topic below its own id, so
+`bluecherry_topic_map_set(BLUECHERRY_TOPIC_DIR_UPLINK, 0x85, "/sensors/humidity")` becomes
+`typeid01/lsiv983s/sensors/humidity`. The cloud adds the prefix, which is what makes naming
+another device's topics impossible rather than merely forbidden.
+
+Mappings reported with `readonly` set come from the **device type** and are shared by every device
+of it. They cannot be changed from the device and they win any collision, so a device mapping on
+the same byte is simply not in force.
+
+Writes are answered in two stages, and the difference matters:
+`BLUECHERRY_TOPIC_MAP_EV_ACCEPTED` says only that the cloud took the request, while the
+`BLUECHERRY_TOPIC_MAP_EV_ENTRY` that follows is what says the mapping is live. A write that was
+allowed but did not reach the database arrives as `BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED`.
+
 ## Roadmap
 
 On the roadmap for this library is the following:
  - Implement the session resumption functionality after deep sleep
- - Implement topic synchronisation.

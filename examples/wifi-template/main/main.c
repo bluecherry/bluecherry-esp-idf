@@ -108,6 +108,45 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
 }
 
 /**
+ * @brief Watch this device's topic map.
+ *
+ * A topic byte is only a number until the cloud maps it to an MQTT topic. This
+ * handler prints the mapping behind each one, and is also where the answer to
+ * bluecherry_topic_map_set() and _delete() arrives.
+ *
+ * Nothing is cached by the library: an entry is valid only for this call, so
+ * copy anything worth keeping. Note the two stages - ACCEPTED means the cloud
+ * took the request, and the ENTRY that follows a write is what says it is live.
+ */
+static void bluecherry_topic_map_handler(bluecherry_topic_map_ev_t event,
+                                         const bluecherry_topic_map_info_t* info, void* args)
+{
+  switch(event) {
+  case BLUECHERRY_TOPIC_MAP_EV_ACCEPTED:
+    ESP_LOGI(TAG, "Topic map request accepted");
+    break;
+
+  case BLUECHERRY_TOPIC_MAP_EV_REJECTED:
+    ESP_LOGW(TAG, "Topic map request refused for topic 0x%02X, reason %d", info->topic, info->err);
+    break;
+
+  case BLUECHERRY_TOPIC_MAP_EV_ENTRY:
+    ESP_LOGI(TAG, "Topic 0x%02X %s %s%s (cause %d)", info->entry->topic,
+             info->entry->dir == BLUECHERRY_TOPIC_DIR_UPLINK ? "UP" : "DOWN", info->entry->suffix,
+             info->entry->readonly ? " [device type, read-only]" : "", info->cause);
+    break;
+
+  case BLUECHERRY_TOPIC_MAP_EV_LIST_DONE:
+    ESP_LOGI(TAG, "Topic map listing complete, %u mapping(s)", info->count);
+    break;
+
+  case BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED:
+    ESP_LOGE(TAG, "Topic map write for 0x%02X did not commit, reason %d", info->topic, info->err);
+    break;
+  }
+}
+
+/**
  * @brief Take the OTA decisions in the application instead of leaving them to the library.
  *
  * Exactly three events carry a decision, and this handler takes all of them explicitly so that
@@ -299,6 +338,10 @@ void app_main(void)
   /* Optional. Without it incoming messages are acknowledged and discarded. */
   bluecherry_set_msg_handler(bluecherry_msg_handler, NULL);
 
+  /* Required to use the topic map calls at all: unlike OTA there is no library
+   * default, so without a handler their answers are parsed and dropped. */
+  bluecherry_set_topic_map_handler(bluecherry_topic_map_handler, NULL);
+
   /* Messages waiting to be published are kept here. Put it wherever you like and make it as
    * large as you need - a static array below, or pass NULL to let the library allocate it. */
   static uint8_t publish_buffer[PUBLISH_BUFFER_SIZE];
@@ -318,6 +361,19 @@ void app_main(void)
   /* The alternative, for the rare device whose credentials were issued by hand and built into
    * the firmware. ZTP above is the normal way. */
   // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, 10, 30, &pub));
+
+  /* Ask what topic bytes this device has. The answer arrives asynchronously in
+   * bluecherry_topic_map_handler above, so this returns immediately.
+   *
+   * Mappings marked read-only come from the device type and are shared by every
+   * device of it. The rest belong to this device, and can be changed from here:
+   *
+   *   bluecherry_topic_map_set(BLUECHERRY_TOPIC_DIR_UPLINK, 0x85, "/sensors/humidity");
+   *   bluecherry_topic_map_delete(BLUECHERRY_TOPIC_DIR_UPLINK, 0x85);
+   *
+   * Uplink and downlink are separate maps, so using one byte both ways is two
+   * calls, one per direction. */
+  ESP_ERROR_CHECK(bluecherry_topic_map_get(BLUECHERRY_TOPIC_SEL_ALL, 0));
 
   uint32_t counter = 0;
 

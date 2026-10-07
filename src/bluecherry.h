@@ -374,7 +374,34 @@ typedef enum {
       16, // Client -> Server: Informs the Server that an error occurred during the OTA update, and
           // that the update should stop. Can be thrown at any time during the download, or at the
           // verification step. (Server will re-try ota up until max 3 times)
+  // Topic map management, 17..19. Lets an application read the topic byte to
+  // MQTT topic map the cloud holds for this device, and edit the half of it this
+  // device owns. See bluecherry_topic_map_get and friends.
+  BLUECHERRY_EVENT_TYPE_TOPIC_MAP_REQUEST =
+      17, // Client -> Server: get, set or delete one of this device's topic mappings.
+  BLUECHERRY_EVENT_TYPE_TOPIC_MAP_STATUS =
+      18, // Server -> Client: the outcome of a request, in two stages. See bluecherry_topic_map_ev.
+  BLUECHERRY_EVENT_TYPE_TOPIC_MAP_ENTRIES =
+      19, // Server -> Client: one or more mappings, whether listed or just written.
 } _bluecherry_event_type;
+
+/**
+ * @brief The topic map payload schema this client speaks.
+ *
+ * Second byte of all three topic map events. The server refuses a request
+ * carrying anything else rather than guessing at its layout, so this only moves
+ * when the field layout does.
+ */
+#define BLUECHERRY_TOPIC_MAP_SCHEMA 1
+
+/**
+ * @brief The longest topic suffix that can be set.
+ *
+ * Bounded by the cloud's topic_string column, not by this protocol: the stored
+ * topic is "<type_id>/<dev_id>" followed by the suffix, and the column holds 256
+ * characters.
+ */
+#define BLUECHERRY_TOPIC_MAX_SUFFIX 239
 
 /**
  * @brief Reason byte appended to BLUECHERRY_EVENT_TYPE_ERROR: the probe reply.
@@ -684,6 +711,221 @@ typedef struct {
  */
 typedef bool (*bluecherry_ota_handler_t)(bluecherry_ota_event_t event,
                                          const bluecherry_ota_info_t* info, void* args);
+
+#pragma region Topic map
+
+/**
+ * @brief Which half of the topic map a mapping belongs to.
+ *
+ * The two halves have INDEPENDENT byte spaces. Uplink 0x25 and downlink 0x25 are
+ * unrelated mappings and may point at different MQTT topics, so a mapping is
+ * only ever identified by this together with its topic byte.
+ *
+ * There is deliberately no "both". Using one topic byte in both directions is
+ * two mappings, and must be set and deleted as two calls - a combined value
+ * could not express the two different topics that are legal on one byte.
+ */
+typedef enum {
+  BLUECHERRY_TOPIC_DIR_UPLINK = 0,  /**< This device publishes, the cloud forwards to MQTT. */
+  BLUECHERRY_TOPIC_DIR_DOWNLINK = 1 /**< MQTT delivers, the cloud forwards to this device. */
+} bluecherry_topic_dir_t;
+
+/**
+ * @brief What a bluecherry_topic_map_get call asks for.
+ *
+ * The first two values are the directions above, so a listing can be narrowed to
+ * one half of the map. BLUECHERRY_TOPIC_SEL_BYTE spans both, which is how one
+ * request answers "what is on 0x25" with its uplink and downlink mappings
+ * together.
+ */
+typedef enum {
+  BLUECHERRY_TOPIC_SEL_UPLINK = 0,   /**< Every uplink mapping. */
+  BLUECHERRY_TOPIC_SEL_DOWNLINK = 1, /**< Every downlink mapping. */
+  BLUECHERRY_TOPIC_SEL_ALL = 2,      /**< Every mapping, both directions. */
+  BLUECHERRY_TOPIC_SEL_BYTE = 3      /**< One topic byte, both directions. */
+} bluecherry_topic_sel_t;
+
+/**
+ * @brief Why the cloud sent a mapping.
+ *
+ * One record shape carries a listing, the result of a write and - in a later
+ * release - a change made in the cloud that this device did not ask for. This is
+ * the only thing that tells them apart, so an application that acts on entries
+ * must look at it.
+ */
+typedef enum {
+  BLUECHERRY_TOPIC_CAUSE_RETRIEVED = 1, /**< Part of a listing this device asked for. */
+  BLUECHERRY_TOPIC_CAUSE_CREATED = 2,   /**< A set that added a mapping. */
+  BLUECHERRY_TOPIC_CAUSE_UPDATED = 3,   /**< A set that replaced one. */
+  BLUECHERRY_TOPIC_CAUSE_DELETED = 4,   /**< A delete. */
+
+  /**
+   * @brief Changed in the cloud without this device asking.
+   *
+   * RESERVED. No server emits it yet, and an application must simply tolerate
+   * it. It is assigned now so that pushing such a change later needs no protocol
+   * change: the same record with a different cause.
+   */
+  BLUECHERRY_TOPIC_CAUSE_CHANGED_EXTERNALLY = 5
+} bluecherry_topic_cause_t;
+
+/**
+ * @brief Why a topic map request was refused, or a write did not land.
+ *
+ * BLUECHERRY_TOPIC_OK is the only success.
+ */
+typedef enum {
+  BLUECHERRY_TOPIC_OK = 0,
+  BLUECHERRY_TOPIC_ERR_READONLY = 1,        /**< The device type owns this byte. */
+  BLUECHERRY_TOPIC_ERR_RESERVED_BYTE = 2,   /**< Byte 0x00 is the internal channel. */
+  BLUECHERRY_TOPIC_ERR_INVALID_TOPIC = 3,   /**< Malformed suffix, or an MQTT wildcard. */
+  BLUECHERRY_TOPIC_ERR_DUPLICATE_TOPIC = 4, /**< That topic is already mapped. */
+  BLUECHERRY_TOPIC_ERR_NOT_FOUND = 5,       /**< No mapping on that byte. */
+  BLUECHERRY_TOPIC_ERR_LIMIT_REACHED = 6,   /**< All 255 bytes of that half are used. */
+  BLUECHERRY_TOPIC_ERR_DB_UNAVAILABLE = 7,
+  BLUECHERRY_TOPIC_ERR_INTERNAL = 8,
+  BLUECHERRY_TOPIC_ERR_NOT_SUPPORTED = 9
+} bluecherry_topic_err_t;
+
+/**
+ * @brief One topic mapping, as reported by the cloud.
+ */
+typedef struct {
+  /**
+   * @brief The topic byte, the value passed to bluecherry_publish.
+   */
+  uint8_t topic;
+
+  /**
+   * @brief Which half of the map this mapping is in.
+   */
+  bluecherry_topic_dir_t dir;
+
+  /**
+   * @brief True when this mapping comes from the device type.
+   *
+   * Every device of the type inherits it, so it cannot be set or deleted from
+   * here: trying returns BLUECHERRY_TOPIC_ERR_READONLY. It also wins any
+   * collision, which is why a device mapping on the same byte is never reported.
+   */
+  bool readonly;
+
+  /**
+   * @brief The topic below this device's own prefix, always starting with '/'.
+   *
+   * NUL-terminated for convenience, and valid ONLY for the duration of the
+   * handler call. Copy it if it is needed afterwards.
+   *
+   * EMPTY on a BLUECHERRY_TOPIC_CAUSE_DELETED entry: the mapping is gone, and
+   * the direction and topic byte are what identify it.
+   *
+   * The full MQTT topic is "<type_id>/<dev_id>" followed by this. The prefix is
+   * never sent: the cloud adds it, which is what makes addressing another
+   * device's topics impossible rather than merely forbidden.
+   */
+  const char* suffix;
+} bluecherry_topic_map_t;
+
+/**
+ * @brief What a topic map handler is being told.
+ */
+typedef enum {
+  /**
+   * @brief The request was well formed and allowed, and is being carried out.
+   *
+   * NOT "the mapping is live". A get is answered with entries in the same
+   * exchange, but a set or delete still has to reach the cloud database, and
+   * BLUECHERRY_TOPIC_MAP_EV_ENTRY is what says it got there. An application that
+   * publishes on a byte the moment it sees this is acting early by its own
+   * choice.
+   */
+  BLUECHERRY_TOPIC_MAP_EV_ACCEPTED = 0,
+
+  /**
+   * @brief The request was refused, and nothing was changed. See err.
+   */
+  BLUECHERRY_TOPIC_MAP_EV_REJECTED,
+
+  /**
+   * @brief One mapping. See cause for why it was sent.
+   */
+  BLUECHERRY_TOPIC_MAP_EV_ENTRY,
+
+  /**
+   * @brief A listing ended. Every entry of it has already been reported.
+   */
+  BLUECHERRY_TOPIC_MAP_EV_LIST_DONE,
+
+  /**
+   * @brief The request was accepted but the write did not land. See err.
+   *
+   * The mapping is unchanged in the cloud. Retrying is reasonable for
+   * BLUECHERRY_TOPIC_ERR_DB_UNAVAILABLE and pointless for the rest.
+   */
+  BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED
+} bluecherry_topic_map_ev_t;
+
+/**
+ * @brief Details of a topic map event.
+ */
+typedef struct {
+  /**
+   * @brief The mapping, on BLUECHERRY_TOPIC_MAP_EV_ENTRY only. NULL otherwise.
+   */
+  const bluecherry_topic_map_t* entry;
+
+  /**
+   * @brief Why the entry was sent, on BLUECHERRY_TOPIC_MAP_EV_ENTRY only.
+   */
+  bluecherry_topic_cause_t cause;
+
+  /**
+   * @brief The reason, on REJECTED and COMMIT_FAILED. BLUECHERRY_TOPIC_OK otherwise.
+   */
+  bluecherry_topic_err_t err;
+
+  /**
+   * @brief The topic byte the request named, echoed back.
+   *
+   * With dir below, this is how an answer is matched to the request that caused
+   * it: a mapping is identified by the pair, so no request id is needed. Zero on
+   * a listing, which names no single byte.
+   */
+  uint8_t topic;
+
+  /**
+   * @brief The direction the request named, echoed back.
+   */
+  bluecherry_topic_dir_t dir;
+
+  /**
+   * @brief How many entries the listing carried, on BLUECHERRY_TOPIC_MAP_EV_LIST_DONE.
+   */
+  uint16_t count;
+} bluecherry_topic_map_info_t;
+
+/**
+ * @brief Header of the function notified of topic map events.
+ *
+ * Called from the synchronisation task, like every other handler here, so it
+ * must not block. Everything it is given is valid only for the duration of the
+ * call.
+ *
+ * Unsolicited events are possible and must not be treated as errors. A listing
+ * interrupted by a reset can be finished after a restart, so entries may arrive
+ * for a request this run never made; the library reports them rather than hiding
+ * them, and what to do about one is the application's to decide.
+ *
+ * @param event What happened.
+ * @param info Details, valid only for the duration of the call.
+ * @param args The argument given to bluecherry_set_topic_map_handler.
+ *
+ * @return None
+ */
+typedef void (*bluecherry_topic_map_handler_t)(bluecherry_topic_map_ev_t event,
+                                               const bluecherry_topic_map_info_t* info, void* args);
+
+#pragma endregion
 
 /**
  * @brief The priority used for automatically syncing with BlueCherry.
@@ -1160,6 +1402,30 @@ typedef struct {
    * @brief Optional user pointer passed to the state handler.
    */
   void* state_handler_args;
+
+  /**
+   * @brief Optional handler notified of topic map events, or NULL.
+   *
+   * NULL means every answer is dropped, which also makes the request itself
+   * pointless: unlike the OTA handler there is no library default to fall back
+   * on, because only the application knows what its topic bytes are for.
+   */
+  bluecherry_topic_map_handler_t topic_map_handler;
+
+  /**
+   * @brief Optional user pointer passed to the topic map handler.
+   */
+  void* topic_map_handler_args;
+
+  /**
+   * @brief Entries seen so far in the listing being received.
+   *
+   * Reset when a listing's first record arrives and reported with
+   * BLUECHERRY_TOPIC_MAP_EV_LIST_DONE, so an application learns how many entries
+   * a listing carried without counting them itself. The only topic map state the
+   * library keeps: the mappings themselves are reported and forgotten.
+   */
+  uint16_t topic_map_count;
 } _bluecherry_t;
 
 /**
@@ -1418,6 +1684,99 @@ esp_err_t bluecherry_ota_mark_valid(void);
  * @return The esp_ota_mark_app_invalid_rollback_and_reboot error, on failure.
  */
 esp_err_t bluecherry_ota_rollback_restart(void);
+
+#pragma region Topic map API
+
+/**
+ * @brief Register a handler for topic map events.
+ *
+ * Required before any of the calls below mean anything: with no handler their
+ * answers are parsed and dropped. Unlike the OTA handler there is no library
+ * default to fall back on, because only the application knows what its topic
+ * bytes are for.
+ *
+ * The handler runs on the bc_sync task and must not block.
+ *
+ * @param handler The handler, or NULL to stop receiving topic map events.
+ * @param args Optional user pointer passed to the handler.
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bluecherry_set_topic_map_handler(bluecherry_topic_map_handler_t handler, void* args);
+
+/**
+ * @brief Ask the cloud for this device's topic mappings.
+ *
+ * Asynchronous. The reply arrives as a BLUECHERRY_TOPIC_MAP_EV_ACCEPTED, then
+ * one BLUECHERRY_TOPIC_MAP_EV_ENTRY per mapping, then
+ * BLUECHERRY_TOPIC_MAP_EV_LIST_DONE. A large map is split over several
+ * exchanges, which the library follows on its own; the application sees only the
+ * entries.
+ *
+ * The listing covers both the mappings this device owns and the read-only ones
+ * inherited from its device type, which is the only way to discover the latter.
+ *
+ * @param sel What to list. BLUECHERRY_TOPIC_SEL_BYTE reports the named byte in
+ * both directions, which is up to two mappings.
+ * @param topic The topic byte, used only with BLUECHERRY_TOPIC_SEL_BYTE.
+ *
+ * @return ESP_OK when the request was queued, ESP_ERR_INVALID_ARG on a bad
+ * selector, ESP_ERR_INVALID_STATE before bluecherry_init, ESP_ERR_NO_MEM when
+ * the publish buffer is full.
+ */
+esp_err_t bluecherry_topic_map_get(bluecherry_topic_sel_t sel, uint8_t topic);
+
+/**
+ * @brief Create or replace one of this device's topic mappings.
+ *
+ * Asynchronous, and answered in two stages. BLUECHERRY_TOPIC_MAP_EV_ACCEPTED
+ * says only that the request was well formed and allowed; the mapping is not
+ * live until BLUECHERRY_TOPIC_MAP_EV_ENTRY reports it, with cause CREATED or
+ * UPDATED. A refusal arrives as BLUECHERRY_TOPIC_MAP_EV_REJECTED, and a write
+ * that was allowed but did not land as BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED.
+ *
+ * Setting a byte that already has a mapping in this direction replaces it.
+ * A byte the device type owns is refused with BLUECHERRY_TOPIC_ERR_READONLY.
+ *
+ * To use one topic byte in both directions, call this twice. There is no
+ * combined direction, deliberately: see bluecherry_topic_dir_t.
+ *
+ * @param dir Which half of the map to write.
+ * @param topic The topic byte, 0x01 to 0xFF. 0x00 is the internal channel and is
+ * refused.
+ * @param suffix The topic below this device's prefix, starting with '/', at most
+ * BLUECHERRY_TOPIC_MAX_SUFFIX characters, with no MQTT wildcard. The cloud
+ * prepends "<type_id>/<dev_id>", so a device cannot name another device's topic.
+ *
+ * @return ESP_OK when the request was queued, ESP_ERR_INVALID_ARG on a bad
+ * direction, byte or suffix, ESP_ERR_INVALID_STATE before bluecherry_init,
+ * ESP_ERR_NO_MEM when the publish buffer is full.
+ */
+esp_err_t bluecherry_topic_map_set(bluecherry_topic_dir_t dir, uint8_t topic, const char* suffix);
+
+/**
+ * @brief Remove one of this device's topic mappings.
+ *
+ * Asynchronous and two-staged exactly as bluecherry_topic_map_set, ending in a
+ * BLUECHERRY_TOPIC_MAP_EV_ENTRY with cause BLUECHERRY_TOPIC_CAUSE_DELETED.
+ *
+ * That entry carries the direction and topic byte, and an EMPTY suffix: the
+ * mapping is identified by the pair, so the topic string that was removed adds
+ * nothing to act on.
+ *
+ * A byte the device type owns is refused with BLUECHERRY_TOPIC_ERR_READONLY
+ * rather than reported as missing: it is plainly there in a listing.
+ *
+ * @param dir Which half of the map to remove from.
+ * @param topic The topic byte.
+ *
+ * @return ESP_OK when the request was queued, ESP_ERR_INVALID_ARG on a bad
+ * direction or byte, ESP_ERR_INVALID_STATE before bluecherry_init,
+ * ESP_ERR_NO_MEM when the publish buffer is full.
+ */
+esp_err_t bluecherry_topic_map_delete(bluecherry_topic_dir_t dir, uint8_t topic);
+
+#pragma endregion
 
 #ifdef __cplusplus
 };

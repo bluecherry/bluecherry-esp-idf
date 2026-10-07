@@ -1565,6 +1565,297 @@ static void _bluecherry_ota_process_chunk(uint8_t* data, uint16_t len)
   }
 }
 
+#pragma region TOPIC MAP
+
+/**
+ * @brief Wire sizes of the three topic map events.
+ *
+ * Every header counts its own event and schema bytes, so a length check reads
+ * the same as the layout in the documentation.
+ */
+#define BLUECHERRY_TOPIC_REQ_HEADER_LEN 6U     /* event, schema, op, sel, byte, suffix len */
+#define BLUECHERRY_TOPIC_STATUS_LEN 7U         /* event, schema, op, stage, code, sel, byte */
+#define BLUECHERRY_TOPIC_ENTRIES_HEADER_LEN 5U /* event, schema, cause, more, count */
+#define BLUECHERRY_TOPIC_ENTRY_HEADER_LEN 4U   /* dir, byte, attrs, suffix len */
+
+/**
+ * @brief Topic map operations, the third byte of a request.
+ */
+#define BLUECHERRY_TOPIC_OP_GET 1U
+#define BLUECHERRY_TOPIC_OP_SET 2U
+#define BLUECHERRY_TOPIC_OP_DELETE 3U
+
+/**
+ * @brief Which half of the two-stage answer a status carries.
+ */
+#define BLUECHERRY_TOPIC_STAGE_VALIDATION 1U
+#define BLUECHERRY_TOPIC_STAGE_COMMIT 2U
+
+/**
+ * @brief Entry attribute bits. Bit 0 marks a device-type mapping.
+ */
+#define BLUECHERRY_TOPIC_ATTR_READONLY 0x01U
+
+/* The request builder writes its header without checking, so the buffer must
+ * hold a maximum-length suffix on top of it. */
+_Static_assert(BLUECHERRY_TOPIC_REQ_HEADER_LEN + BLUECHERRY_TOPIC_MAX_SUFFIX <=
+                   BLUECHERRY_MAX_MESSAGE_LEN -
+                       (BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE),
+               "a maximum-length topic map request does not fit a BlueCherry record");
+
+/**
+ * @brief Report a topic map event to the application, if it registered one.
+ *
+ * A single gate, unlike the OTA handler's two: there is no library default to
+ * fall back on, because only the application knows what its topic bytes are for.
+ */
+static void _bluecherry_topic_map_notify(bluecherry_topic_map_ev_t event,
+                                         const bluecherry_topic_map_info_t* info)
+{
+  if(_bluecherry_opdata.topic_map_handler == NULL) {
+    return;
+  }
+
+  _bluecherry_opdata.topic_map_handler(event, info, _bluecherry_opdata.topic_map_handler_args);
+}
+
+/**
+ * @brief Handle a TOPIC_MAP_STATUS record.
+ *
+ * A commit that succeeded raises nothing here: the entries record that follows
+ * reports the mapping itself, and raising both would make an application handle
+ * one write twice. Only a commit that failed has nothing else to arrive, so only
+ * that one becomes an event.
+ *
+ * @param data The record, starting at its event byte.
+ * @param len The record length.
+ */
+static void _bluecherry_topic_map_process_status(const uint8_t* data, uint8_t len)
+{
+  if(len != BLUECHERRY_TOPIC_STATUS_LEN || data[1] != BLUECHERRY_TOPIC_MAP_SCHEMA) {
+    ESP_LOGW(TAG, "Malformed topic map status, ignoring");
+    return;
+  }
+
+  const uint8_t stage = data[3];
+  const uint8_t code = data[4];
+  const uint8_t sel = data[5];
+
+  bluecherry_topic_map_info_t info = {
+    .err = (bluecherry_topic_err_t) code,
+    .topic = data[6],
+    /* Only the two direction selectors name a half of the map; a listing scope
+     * does not, and reports the default rather than inventing one. */
+    .dir = sel == (uint8_t) BLUECHERRY_TOPIC_DIR_DOWNLINK ? BLUECHERRY_TOPIC_DIR_DOWNLINK
+                                                          : BLUECHERRY_TOPIC_DIR_UPLINK,
+  };
+
+  if(stage == BLUECHERRY_TOPIC_STAGE_VALIDATION) {
+    if(code == BLUECHERRY_TOPIC_OK) {
+      ESP_LOGD(TAG, "Topic map request accepted");
+      _bluecherry_topic_map_notify(BLUECHERRY_TOPIC_MAP_EV_ACCEPTED, &info);
+    } else {
+      ESP_LOGW(TAG, "Topic map request rejected, reason %u", code);
+      _bluecherry_topic_map_notify(BLUECHERRY_TOPIC_MAP_EV_REJECTED, &info);
+    }
+    return;
+  }
+
+  if(stage != BLUECHERRY_TOPIC_STAGE_COMMIT) {
+    /* A stage this client does not know. Reporting it as either of the two it
+     * does would be a guess about what the cloud meant. */
+    ESP_LOGW(TAG, "Topic map status with unknown stage %u, ignoring", stage);
+    return;
+  }
+
+  if(code != BLUECHERRY_TOPIC_OK) {
+    ESP_LOGE(TAG, "Topic map write did not commit, reason %u", code);
+    _bluecherry_topic_map_notify(BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED, &info);
+  }
+}
+
+/**
+ * @brief Report one entry out of an entries record.
+ *
+ * @param data The record.
+ * @param len The record length.
+ * @param offset Where this entry starts.
+ * @param cause Why the record was sent.
+ *
+ * @return The offset of the next entry, or 0 when the record is malformed.
+ */
+static uint8_t _bluecherry_topic_map_report_entry(const uint8_t* data, uint8_t len, uint8_t offset,
+                                                  bluecherry_topic_cause_t cause)
+{
+  if(offset + BLUECHERRY_TOPIC_ENTRY_HEADER_LEN > len) {
+    return 0;
+  }
+
+  const uint8_t suffix_len = data[offset + 3];
+
+  /* Widened on purpose: offset and suffix_len are both bytes, so the sum can
+   * exceed 255 and wrap, and a wrapped end would read as comfortably inside the
+   * record instead of past it. */
+  const unsigned end = (unsigned) offset + BLUECHERRY_TOPIC_ENTRY_HEADER_LEN + suffix_len;
+  if(end > len || suffix_len > BLUECHERRY_TOPIC_MAX_SUFFIX) {
+    return 0;
+  }
+
+  /* The record holds the suffix unterminated, and handing the application a
+   * length to respect is a trap nobody respects. Copied out rather than
+   * terminated in place because in_buf holds the records that follow. */
+  char suffix[BLUECHERRY_TOPIC_MAX_SUFFIX + 1];
+  memcpy(suffix, data + offset + BLUECHERRY_TOPIC_ENTRY_HEADER_LEN, suffix_len);
+  suffix[suffix_len] = '\0';
+
+  const bluecherry_topic_map_t entry = {
+    .topic = data[offset + 1],
+    .dir = data[offset] == (uint8_t) BLUECHERRY_TOPIC_DIR_DOWNLINK ? BLUECHERRY_TOPIC_DIR_DOWNLINK
+                                                                   : BLUECHERRY_TOPIC_DIR_UPLINK,
+    .readonly = (data[offset + 2] & BLUECHERRY_TOPIC_ATTR_READONLY) != 0,
+    .suffix = suffix,
+  };
+
+  const bluecherry_topic_map_info_t info = {
+    .entry = &entry,
+    .cause = cause,
+    .topic = entry.topic,
+    .dir = entry.dir,
+  };
+  _bluecherry_topic_map_notify(BLUECHERRY_TOPIC_MAP_EV_ENTRY, &info);
+
+  /* Narrowing is safe: end was just checked against len, which is a uint8_t. */
+  return (uint8_t) end;
+}
+
+/**
+ * @brief Handle a TOPIC_MAP_ENTRIES record.
+ *
+ * Entries are reported as they are parsed and never stored, so a map of any size
+ * costs the same. A listing larger than one record arrives over several, and the
+ * cloud keeps answering CONTINUE until the last of them, so the sync task fetches
+ * the rest on its own: paging needs no state here beyond the running count.
+ *
+ * Only a listing ends in BLUECHERRY_TOPIC_MAP_EV_LIST_DONE. A write result is a
+ * single entry and has no list to finish.
+ *
+ * @param data The record, starting at its event byte.
+ * @param len The record length.
+ */
+static void _bluecherry_topic_map_process_entries(const uint8_t* data, uint8_t len)
+{
+  if(len < BLUECHERRY_TOPIC_ENTRIES_HEADER_LEN || data[1] != BLUECHERRY_TOPIC_MAP_SCHEMA) {
+    ESP_LOGW(TAG, "Malformed topic map entries record, ignoring");
+    return;
+  }
+
+  const bluecherry_topic_cause_t cause = (bluecherry_topic_cause_t) data[2];
+  const bool more = data[3] != 0;
+  const uint8_t count = data[4];
+
+  uint8_t offset = BLUECHERRY_TOPIC_ENTRIES_HEADER_LEN;
+  for(uint8_t i = 0; i < count; i++) {
+    offset = _bluecherry_topic_map_report_entry(data, len, offset, cause);
+    if(offset == 0) {
+      /* Entries already reported stand: each one was complete and correct when
+       * it was read. Only the remainder of this record is lost. */
+      ESP_LOGW(TAG, "Truncated topic map entry %u of %u, dropping the rest of the record", i, count);
+      return;
+    }
+    _bluecherry_opdata.topic_map_count++;
+  }
+
+  if(cause != BLUECHERRY_TOPIC_CAUSE_RETRIEVED || more) {
+    return;
+  }
+
+  const bluecherry_topic_map_info_t info = { .count = _bluecherry_opdata.topic_map_count };
+  _bluecherry_opdata.topic_map_count = 0;
+  _bluecherry_topic_map_notify(BLUECHERRY_TOPIC_MAP_EV_LIST_DONE, &info);
+}
+
+/**
+ * @brief Frame and queue one topic map request.
+ *
+ * Queued in the ordinary publish ring rather than the single internal-event
+ * slot, which is the one thing that makes this feature safe to call at any
+ * moment: that slot holds one message and a second write destroys the first, so
+ * a request issued mid-update would clobber an OTA reply, or be clobbered by
+ * one. The ring is peeked, sent and only popped once acknowledged, so requests
+ * queue and retransmit like any other message.
+ *
+ * @param op The operation.
+ * @param sel The selector, or the direction for a write.
+ * @param topic The topic byte.
+ * @param suffix The topic suffix for a set, NULL otherwise.
+ *
+ * @return ESP_OK when queued, or the ring push error.
+ */
+static esp_err_t _bluecherry_topic_map_request(uint8_t op, uint8_t sel, uint8_t topic,
+                                               const char* suffix)
+{
+  const size_t suffix_len = suffix == NULL ? 0 : strlen(suffix);
+
+  uint8_t payload[BLUECHERRY_TOPIC_REQ_HEADER_LEN + BLUECHERRY_TOPIC_MAX_SUFFIX];
+  payload[0] = BLUECHERRY_EVENT_TYPE_TOPIC_MAP_REQUEST;
+  payload[1] = BLUECHERRY_TOPIC_MAP_SCHEMA;
+  payload[2] = op;
+  payload[3] = sel;
+  payload[4] = topic;
+  payload[5] = (uint8_t) suffix_len;
+  if(suffix_len > 0) {
+    memcpy(payload + BLUECHERRY_TOPIC_REQ_HEADER_LEN, suffix, suffix_len);
+  }
+
+  esp_err_t ret = _bluecherry_ring_push(0x00, (uint16_t) (BLUECHERRY_TOPIC_REQ_HEADER_LEN + suffix_len),
+                                        payload);
+  if(ret != ESP_OK) {
+    return ret;
+  }
+
+  _bluecherry_request_sync();
+  return ESP_OK;
+}
+
+/**
+ * @brief Check a suffix against the rules the cloud enforces.
+ *
+ * Checked here as well so a malformed suffix costs no round trip. The cloud
+ * checks the same things regardless: this is convenience, never the guard.
+ *
+ * @param suffix The suffix to check.
+ *
+ * @return True when the cloud would accept it.
+ */
+static bool _bluecherry_topic_suffix_valid(const char* suffix)
+{
+  if(suffix == NULL || suffix[0] != '/') {
+    return false;
+  }
+
+  const size_t len = strlen(suffix);
+  if(len > BLUECHERRY_TOPIC_MAX_SUFFIX || suffix[len - 1] == '/') {
+    return false;
+  }
+
+  for(size_t i = 0; i < len; i++) {
+    const char c = suffix[i];
+    /* Wildcards are refused in both directions: these mappings are read back as
+     * subscriptions too, and a device must not be able to widen what it receives
+     * by publishing to a pattern. */
+    if(c == '+' || c == '#' || (unsigned char) c < 0x20 || (unsigned char) c == 0x7F) {
+      return false;
+    }
+    if(i > 0 && c == '/' && suffix[i - 1] == '/') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+#pragma endregion
+
 /**
  * @brief Process an incoming BlueCherry event.
  *
@@ -1619,6 +1910,14 @@ static void _bluecherry_process_event(uint8_t* data, uint8_t len)
 
   case BLUECHERRY_EVENT_TYPE_OTA_CHUNK:
     _bluecherry_ota_process_chunk(data + 1, len - 1);
+    break;
+
+  case BLUECHERRY_EVENT_TYPE_TOPIC_MAP_STATUS:
+    _bluecherry_topic_map_process_status(data, len);
+    break;
+
+  case BLUECHERRY_EVENT_TYPE_TOPIC_MAP_ENTRIES:
+    _bluecherry_topic_map_process_entries(data, len);
     break;
 
   default:
@@ -3500,6 +3799,15 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
     return ESP_ERR_INVALID_SIZE;
   }
 
+  /* Topic 0x00 is BlueCherry's internal channel, not an application topic: the
+   * cloud reads anything arriving on it as a protocol event. Publishing there
+   * has never delivered a message, and now that the channel carries a write API
+   * it would let application data be read as a topic map request. */
+  if(topic == 0x00) {
+    ESP_LOGE(TAG, "Topic 0x00 is reserved for the BlueCherry internal channel");
+    return ESP_ERR_INVALID_ARG;
+  }
+
   esp_err_t ret = _bluecherry_ring_push(topic, len, data);
   if(ret != ESP_OK) {
     return ret;
@@ -3599,6 +3907,60 @@ esp_err_t bluecherry_ota_rollback_restart(void)
   ESP_LOGW(TAG, "OTA: rolling back to the previous firmware");
   return esp_ota_mark_app_invalid_rollback_and_reboot();
 }
+
+#pragma region TOPIC MAP API
+
+esp_err_t bluecherry_set_topic_map_handler(bluecherry_topic_map_handler_t handler, void* args)
+{
+  _bluecherry_opdata.topic_map_handler = handler;
+  _bluecherry_opdata.topic_map_handler_args = args;
+
+  return ESP_OK;
+}
+
+esp_err_t bluecherry_topic_map_get(bluecherry_topic_sel_t sel, uint8_t topic)
+{
+  if(sel > BLUECHERRY_TOPIC_SEL_BYTE) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGD(TAG, "Requesting topic map, selector %u", (unsigned) sel);
+  return _bluecherry_topic_map_request(BLUECHERRY_TOPIC_OP_GET, (uint8_t) sel, topic, NULL);
+}
+
+esp_err_t bluecherry_topic_map_set(bluecherry_topic_dir_t dir, uint8_t topic, const char* suffix)
+{
+  /* Byte 0x00 is the internal channel. The cloud refuses it too, but catching it
+   * here is what keeps a typo from costing a round trip. */
+  if(dir > BLUECHERRY_TOPIC_DIR_DOWNLINK || topic == 0x00 ||
+     !_bluecherry_topic_suffix_valid(suffix)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGD(TAG, "Setting topic map %u byte 0x%02X to %s", (unsigned) dir, topic, suffix);
+  return _bluecherry_topic_map_request(BLUECHERRY_TOPIC_OP_SET, (uint8_t) dir, topic, suffix);
+}
+
+esp_err_t bluecherry_topic_map_delete(bluecherry_topic_dir_t dir, uint8_t topic)
+{
+  if(dir > BLUECHERRY_TOPIC_DIR_DOWNLINK || topic == 0x00) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGD(TAG, "Deleting topic map %u byte 0x%02X", (unsigned) dir, topic);
+  return _bluecherry_topic_map_request(BLUECHERRY_TOPIC_OP_DELETE, (uint8_t) dir, topic, NULL);
+}
+
+#pragma endregion
 
 esp_err_t bluecherry_sync(void)
 {
