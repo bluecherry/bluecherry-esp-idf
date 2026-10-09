@@ -176,10 +176,17 @@ Mappings reported with `readonly` set come from the **device type** and are shar
 of it. They cannot be changed from the device and they win any collision, so a device mapping on
 the same byte is simply not in force.
 
-Writes are answered in two stages, and the difference matters:
-`BLUECHERRY_TOPIC_MAP_EV_ACCEPTED` says only that the cloud took the request, while the
-`BLUECHERRY_TOPIC_MAP_EV_ENTRY` that follows is what says the mapping is live. A write that was
-allowed but did not reach the database arrives as `BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED`.
+A set or delete is answered with `BLUECHERRY_TOPIC_MAP_EV_ACCEPTED`, which says only that the
+cloud took the request, or `BLUECHERRY_TOPIC_MAP_EV_REJECTED`. The mapping is live once a
+`BLUECHERRY_TOPIC_MAP_EV_ENTRY` with cause `CREATED`, `UPDATED` or `DELETED` reports it. A write
+that was allowed but did not reach the database arrives as `BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED`.
+
+A change made in the cloud arrives as that same entry, with no request behind it, so one piece of
+code handles both. The cloud only sends one within a connection in which the device has made a
+topic map request, because older firmware cannot handle it. After a reconnect nothing is reported
+until the application asks again, so an application that wants every change makes a request at
+the start of each connection; the `wifi-template` example lists the map from its state handler.
+A later protocol version is to lift this.
 
 ## Roadmap
 

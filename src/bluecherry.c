@@ -1586,7 +1586,8 @@ static void _bluecherry_ota_process_chunk(uint8_t* data, uint16_t len)
 #define BLUECHERRY_TOPIC_OP_DELETE 3U
 
 /**
- * @brief Which half of the two-stage answer a status carries.
+ * @brief Which answer to a set or delete a status carries: the immediate accepted
+ * or refused, or the later one the cloud sends only for a write that failed.
  */
 #define BLUECHERRY_TOPIC_STAGE_VALIDATION 1U
 #define BLUECHERRY_TOPIC_STAGE_COMMIT 2U
@@ -1622,10 +1623,9 @@ static void _bluecherry_topic_map_notify(bluecherry_topic_map_ev_t event,
 /**
  * @brief Handle a TOPIC_MAP_STATUS record.
  *
- * A commit that succeeded raises nothing here: the entries record that follows
- * reports the mapping itself, and raising both would make an application handle
- * one write twice. Only a commit that failed has nothing else to arrive, so only
- * that one becomes an event.
+ * The cloud sends a commit status only for a write that failed. A write that
+ * landed is reported by its entry instead, the same way a change made in the
+ * cloud is, so a successful commit status, should one arrive, raises nothing.
  *
  * @param data The record, starting at its event byte.
  * @param len The record length.
@@ -1736,8 +1736,9 @@ static uint8_t _bluecherry_topic_map_report_entry(const uint8_t* data, uint8_t l
  * cloud keeps answering CONTINUE until the last of them, so the sync task fetches
  * the rest on its own: paging needs no state here beyond the running count.
  *
- * Only a listing ends in BLUECHERRY_TOPIC_MAP_EV_LIST_DONE. A write result is a
- * single entry and has no list to finish.
+ * Only a listing ends in BLUECHERRY_TOPIC_MAP_EV_LIST_DONE, and only its entries
+ * are counted. A change can arrive between two pages of a listing, and is
+ * reported on its own without touching the count.
  *
  * @param data The record, starting at its event byte.
  * @param len The record length.
@@ -1750,6 +1751,7 @@ static void _bluecherry_topic_map_process_entries(const uint8_t* data, uint8_t l
   }
 
   const bluecherry_topic_cause_t cause = (bluecherry_topic_cause_t) data[2];
+  const bool listed = cause == BLUECHERRY_TOPIC_CAUSE_RETRIEVED;
   const bool more = data[3] != 0;
   const uint8_t count = data[4];
 
@@ -1759,13 +1761,16 @@ static void _bluecherry_topic_map_process_entries(const uint8_t* data, uint8_t l
     if(offset == 0) {
       /* Entries already reported stand: each one was complete and correct when
        * it was read. Only the remainder of this record is lost. */
-      ESP_LOGW(TAG, "Truncated topic map entry %u of %u, dropping the rest of the record", i, count);
+      ESP_LOGW(TAG, "Truncated topic map entry %u of %u, dropping the rest of the record", i,
+               count);
       return;
     }
-    _bluecherry_opdata.topic_map_count++;
+    if(listed) {
+      _bluecherry_opdata.topic_map_count++;
+    }
   }
 
-  if(cause != BLUECHERRY_TOPIC_CAUSE_RETRIEVED || more) {
+  if(!listed || more) {
     return;
   }
 
@@ -1807,8 +1812,8 @@ static esp_err_t _bluecherry_topic_map_request(uint8_t op, uint8_t sel, uint8_t 
     memcpy(payload + BLUECHERRY_TOPIC_REQ_HEADER_LEN, suffix, suffix_len);
   }
 
-  esp_err_t ret = _bluecherry_ring_push(0x00, (uint16_t) (BLUECHERRY_TOPIC_REQ_HEADER_LEN + suffix_len),
-                                        payload);
+  esp_err_t ret = _bluecherry_ring_push(
+      0x00, (uint16_t) (BLUECHERRY_TOPIC_REQ_HEADER_LEN + suffix_len), payload);
   if(ret != ESP_OK) {
     return ret;
   }

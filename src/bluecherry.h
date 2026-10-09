@@ -375,14 +375,15 @@ typedef enum {
           // that the update should stop. Can be thrown at any time during the download, or at the
           // verification step. (Server will re-try ota up until max 3 times)
   // Topic map management, 17..19. Lets an application read the topic byte to
-  // MQTT topic map the cloud holds for this device, and edit the half of it this
-  // device owns. See bluecherry_topic_map_get and friends.
+  // MQTT topic map the cloud holds for this device, edit the half of it this
+  // device owns, and hear about every change. See bluecherry_topic_map_get and
+  // friends.
   BLUECHERRY_EVENT_TYPE_TOPIC_MAP_REQUEST =
       17, // Client -> Server: get, set or delete one of this device's topic mappings.
   BLUECHERRY_EVENT_TYPE_TOPIC_MAP_STATUS =
-      18, // Server -> Client: the outcome of a request, in two stages. See bluecherry_topic_map_ev.
+      18, // Server -> Client: a set or delete accepted, refused or failed.
   BLUECHERRY_EVENT_TYPE_TOPIC_MAP_ENTRIES =
-      19, // Server -> Client: one or more mappings, whether listed or just written.
+      19, // Server -> Client: one or more mappings, listed or changed.
 } _bluecherry_event_type;
 
 /**
@@ -748,25 +749,15 @@ typedef enum {
 /**
  * @brief Why the cloud sent a mapping.
  *
- * One record shape carries a listing, the result of a write and - in a later
- * release - a change made in the cloud that this device did not ask for. This is
- * the only thing that tells them apart, so an application that acts on entries
- * must look at it.
+ * Either part of a listing this device asked for, or a change to its map. A
+ * change is reported the same way whether this device made it or it was made in
+ * the cloud, so one piece of code handles both.
  */
 typedef enum {
   BLUECHERRY_TOPIC_CAUSE_RETRIEVED = 1, /**< Part of a listing this device asked for. */
-  BLUECHERRY_TOPIC_CAUSE_CREATED = 2,   /**< A set that added a mapping. */
-  BLUECHERRY_TOPIC_CAUSE_UPDATED = 3,   /**< A set that replaced one. */
-  BLUECHERRY_TOPIC_CAUSE_DELETED = 4,   /**< A delete. */
-
-  /**
-   * @brief Changed in the cloud without this device asking.
-   *
-   * RESERVED. No server emits it yet, and an application must simply tolerate
-   * it. It is assigned now so that pushing such a change later needs no protocol
-   * change: the same record with a different cause.
-   */
-  BLUECHERRY_TOPIC_CAUSE_CHANGED_EXTERNALLY = 5
+  BLUECHERRY_TOPIC_CAUSE_CREATED = 2,   /**< A mapping was added. */
+  BLUECHERRY_TOPIC_CAUSE_UPDATED = 3,   /**< A mapping was replaced, or became read-only or not. */
+  BLUECHERRY_TOPIC_CAUSE_DELETED = 4    /**< A mapping was removed. */
 } bluecherry_topic_cause_t;
 
 /**
@@ -831,23 +822,27 @@ typedef struct {
  */
 typedef enum {
   /**
-   * @brief The request was well formed and allowed, and is being carried out.
+   * @brief A set or delete was well formed and allowed, and is being carried out.
    *
-   * NOT "the mapping is live". A get is answered with entries in the same
-   * exchange, but a set or delete still has to reach the cloud database, and
-   * BLUECHERRY_TOPIC_MAP_EV_ENTRY is what says it got there. An application that
-   * publishes on a byte the moment it sees this is acting early by its own
-   * choice.
+   * NOT "the mapping is live". The write still has to reach the cloud database,
+   * and the BLUECHERRY_TOPIC_MAP_EV_ENTRY reporting the change is what says it
+   * got there. An application that publishes on a byte the moment it sees this
+   * is acting early by its own choice.
+   *
+   * A get has no such answer: its entries are the answer.
    */
   BLUECHERRY_TOPIC_MAP_EV_ACCEPTED = 0,
 
   /**
-   * @brief The request was refused, and nothing was changed. See err.
+   * @brief A set or delete was refused, and nothing was changed. See err.
    */
   BLUECHERRY_TOPIC_MAP_EV_REJECTED,
 
   /**
    * @brief One mapping. See cause for why it was sent.
+   *
+   * A change to the map arrives as this event whether this device made it or it
+   * was made in the cloud, so it can come with no request outstanding.
    */
   BLUECHERRY_TOPIC_MAP_EV_ENTRY,
 
@@ -857,7 +852,7 @@ typedef enum {
   BLUECHERRY_TOPIC_MAP_EV_LIST_DONE,
 
   /**
-   * @brief The request was accepted but the write did not land. See err.
+   * @brief A set or delete was accepted but the write did not land. See err.
    *
    * The mapping is unchanged in the cloud. Retrying is reasonable for
    * BLUECHERRY_TOPIC_ERR_DB_UNAVAILABLE and pointless for the rest.
@@ -885,16 +880,17 @@ typedef struct {
   bluecherry_topic_err_t err;
 
   /**
-   * @brief The topic byte the request named, echoed back.
+   * @brief The topic byte: the entry's on BLUECHERRY_TOPIC_MAP_EV_ENTRY, and the
+   * one the request named on the other events, echoed back.
    *
    * With dir below, this is how an answer is matched to the request that caused
    * it: a mapping is identified by the pair, so no request id is needed. Zero on
-   * a listing, which names no single byte.
+   * BLUECHERRY_TOPIC_MAP_EV_LIST_DONE, which names no single byte.
    */
   uint8_t topic;
 
   /**
-   * @brief The direction the request named, echoed back.
+   * @brief The direction, taken the same way as topic.
    */
   bluecherry_topic_dir_t dir;
 
@@ -911,10 +907,18 @@ typedef struct {
  * must not block. Everything it is given is valid only for the duration of the
  * call.
  *
- * Unsolicited events are possible and must not be treated as errors. A listing
- * interrupted by a reset can be finished after a restart, so entries may arrive
- * for a request this run never made; the library reports them rather than hiding
- * them, and what to do about one is the application's to decide.
+ * Unsolicited events are normal and must not be treated as errors. A change made
+ * in the cloud arrives as an entry nobody asked for, and a listing interrupted by
+ * a reset can be finished after a restart, so entries may arrive for a request
+ * this run never made.
+ *
+ * The cloud only sends a change unasked within a connection in which this device
+ * has made a topic map request, because older firmware cannot handle one. After
+ * a reconnect it reports nothing until the application asks again. An
+ * application that wants every change therefore makes a request at the start of
+ * each connection, for instance a bluecherry_topic_map_get when its state handler
+ * sees BLUECHERRY_STATE_AWAIT_CONNECTION give way to a later state. A later
+ * protocol version is to lift this.
  *
  * @param event What happened.
  * @param info Details, valid only for the duration of the call.
@@ -1420,7 +1424,7 @@ typedef struct {
   /**
    * @brief Entries seen so far in the listing being received.
    *
-   * Reset when a listing's first record arrives and reported with
+   * Counts listed entries only, and is reported and reset with
    * BLUECHERRY_TOPIC_MAP_EV_LIST_DONE, so an application learns how many entries
    * a listing carried without counting them itself. The only topic map state the
    * library keeps: the mappings themselves are reported and forgotten.
@@ -1707,14 +1711,17 @@ esp_err_t bluecherry_set_topic_map_handler(bluecherry_topic_map_handler_t handle
 /**
  * @brief Ask the cloud for this device's topic mappings.
  *
- * Asynchronous. The reply arrives as a BLUECHERRY_TOPIC_MAP_EV_ACCEPTED, then
- * one BLUECHERRY_TOPIC_MAP_EV_ENTRY per mapping, then
+ * Asynchronous. The reply arrives as one BLUECHERRY_TOPIC_MAP_EV_ENTRY per
+ * mapping, with cause BLUECHERRY_TOPIC_CAUSE_RETRIEVED, then
  * BLUECHERRY_TOPIC_MAP_EV_LIST_DONE. A large map is split over several
  * exchanges, which the library follows on its own; the application sees only the
  * entries.
  *
  * The listing covers both the mappings this device owns and the read-only ones
  * inherited from its device type, which is the only way to discover the latter.
+ *
+ * Like any topic map request it also has the cloud report changes made there for
+ * the rest of the connection. See bluecherry_topic_map_handler_t.
  *
  * @param sel What to list. BLUECHERRY_TOPIC_SEL_BYTE reports the named byte in
  * both directions, which is up to two mappings.
@@ -1729,11 +1736,13 @@ esp_err_t bluecherry_topic_map_get(bluecherry_topic_sel_t sel, uint8_t topic);
 /**
  * @brief Create or replace one of this device's topic mappings.
  *
- * Asynchronous, and answered in two stages. BLUECHERRY_TOPIC_MAP_EV_ACCEPTED
- * says only that the request was well formed and allowed; the mapping is not
- * live until BLUECHERRY_TOPIC_MAP_EV_ENTRY reports it, with cause CREATED or
- * UPDATED. A refusal arrives as BLUECHERRY_TOPIC_MAP_EV_REJECTED, and a write
- * that was allowed but did not land as BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED.
+ * Asynchronous. BLUECHERRY_TOPIC_MAP_EV_ACCEPTED says only that the request was
+ * well formed and allowed; the mapping is live once BLUECHERRY_TOPIC_MAP_EV_ENTRY
+ * reports it, with cause CREATED or UPDATED, the same event a change made in the
+ * cloud raises. A refusal arrives as BLUECHERRY_TOPIC_MAP_EV_REJECTED, and a
+ * write that was allowed but did not land as
+ * BLUECHERRY_TOPIC_MAP_EV_COMMIT_FAILED. Setting a mapping to what it already is
+ * still ends in its entry.
  *
  * Setting a byte that already has a mapping in this direction replaces it.
  * A byte the device type owns is refused with BLUECHERRY_TOPIC_ERR_READONLY.
@@ -1757,7 +1766,7 @@ esp_err_t bluecherry_topic_map_set(bluecherry_topic_dir_t dir, uint8_t topic, co
 /**
  * @brief Remove one of this device's topic mappings.
  *
- * Asynchronous and two-staged exactly as bluecherry_topic_map_set, ending in a
+ * Asynchronous and answered exactly as bluecherry_topic_map_set, ending in a
  * BLUECHERRY_TOPIC_MAP_EV_ENTRY with cause BLUECHERRY_TOPIC_CAUSE_DELETED.
  *
  * That entry carries the direction and topic byte, and an EMPTY suffix: the

@@ -115,15 +115,16 @@ static void bluecherry_msg_handler(uint8_t topic, uint16_t len, const uint8_t* d
  * bluecherry_topic_map_set() and _delete() arrives.
  *
  * Nothing is cached by the library: an entry is valid only for this call, so
- * copy anything worth keeping. Note the two stages - ACCEPTED means the cloud
- * took the request, and the ENTRY that follows a write is what says it is live.
+ * copy anything worth keeping. ACCEPTED means the cloud took a set or delete;
+ * the ENTRY reporting the change is what says it is live. A change made in the
+ * cloud arrives as the same ENTRY, with no request behind it.
  */
 static void bluecherry_topic_map_handler(bluecherry_topic_map_ev_t event,
                                          const bluecherry_topic_map_info_t* info, void* args)
 {
   switch(event) {
   case BLUECHERRY_TOPIC_MAP_EV_ACCEPTED:
-    ESP_LOGI(TAG, "Topic map request accepted");
+    ESP_LOGI(TAG, "Topic map write for 0x%02X accepted", info->topic);
     break;
 
   case BLUECHERRY_TOPIC_MAP_EV_REJECTED:
@@ -228,9 +229,14 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
  */
 static void bluecherry_state_handler(bluecherry_state state, void* args)
 {
+  /* Set while there is no connection, so the first state after one comes up is
+   * known to start a new connection. */
+  static bool connecting = false;
+
   switch(state) {
   case BLUECHERRY_STATE_AWAIT_CONNECTION:
     ESP_LOGI(TAG, "BlueCherry connecting...");
+    connecting = true;
     break;
 
   case BLUECHERRY_STATE_IDLE:
@@ -239,6 +245,17 @@ static void bluecherry_state_handler(bluecherry_state state, void* args)
 
   default:
     break;
+  }
+
+  /* The cloud only reports changes to the topic map within a connection in which
+   * this device has made a topic map request, so list the map at the start of
+   * every connection. The answer arrives in bluecherry_topic_map_handler. Every
+   * state from IDLE on means the connection is up. */
+  if(connecting && state >= BLUECHERRY_STATE_IDLE) {
+    connecting = false;
+    if(bluecherry_topic_map_get(BLUECHERRY_TOPIC_SEL_ALL, 0) != ESP_OK) {
+      ESP_LOGW(TAG, "Could not request the topic map");
+    }
   }
 }
 
@@ -362,8 +379,8 @@ void app_main(void)
    * the firmware. ZTP above is the normal way. */
   // ESP_ERROR_CHECK(bluecherry_init(devcert, devkey, 10, 30, &pub));
 
-  /* Ask what topic bytes this device has. The answer arrives asynchronously in
-   * bluecherry_topic_map_handler above, so this returns immediately.
+  /* The topic map is listed by bluecherry_state_handler above, at the start of
+   * every connection, and printed by bluecherry_topic_map_handler.
    *
    * Mappings marked read-only come from the device type and are shared by every
    * device of it. The rest belong to this device, and can be changed from here:
@@ -373,7 +390,6 @@ void app_main(void)
    *
    * Uplink and downlink are separate maps, so using one byte both ways is two
    * calls, one per direction. */
-  ESP_ERROR_CHECK(bluecherry_topic_map_get(BLUECHERRY_TOPIC_SEL_ALL, 0));
 
   uint32_t counter = 0;
 
