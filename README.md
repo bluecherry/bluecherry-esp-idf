@@ -151,6 +151,10 @@ the bootloader rolls it back on the next restart. The library confirms it for yo
 takes `BLUECHERRY_OTA_EVENT_FIRSTBOOT` calls `bluecherry_ota_mark_valid` itself once it is
 satisfied, or `bluecherry_ota_rollback_restart` to return to the previous firmware.
 
+The platform identifies firmware by the SHA-256 that ESP-IDF appends to the image. `idf.py
+fingerprint` prints it for your project, signed image or not. For updates that devices only
+install when signed with your key, see [examples/secure-boot](examples/secure-boot).
+
 ## Roadmap
 
 On the roadmap for this library is the following:

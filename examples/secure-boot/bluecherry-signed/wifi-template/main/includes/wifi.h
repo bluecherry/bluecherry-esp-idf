@@ -1,10 +1,10 @@
 /**
  * @file wifi.h
  * @author Daan Pape (daan@dptechnics.com)
- * @brief This code connects to the BlueCherry platform.
- * @version 1.3.3
- * @date 2025-07-25
- * @copyright Copyright (c) 2025 DPTechnics BV
+ * @brief WiFi credentials and station bring-up for the BlueCherry example.
+ * @version 1.4.0
+ * @date 2026-09-15
+ * @copyright Copyright (c) 2025-2026 DPTechnics BV <info@dptechnics.com>
  *
  * This example is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #define WIFI_H
 
 #include <esp_wifi.h>
+#include <esp_err.h>
 
 /**
  * @brief Fill in the SSID of the WiFi network you want to connect to.
@@ -39,5 +40,15 @@
  * @brief Choose the WiFi authentication method that your network uses.
  */
 #define WIFI_AUTH_MODE WIFI_AUTH_WPA2_PSK
+
+/**
+ * @brief Bring up the WiFi station and wait until the network is usable.
+ *
+ * Connects to the network configured above and blocks until an IP address has been assigned.
+ * Nothing in this example talks to BlueCherry before this returns.
+ *
+ * @return ESP_OK once connected.
+ */
+esp_err_t wifi_init(void);
 
 #endif

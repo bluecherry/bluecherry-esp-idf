@@ -6,3 +6,5 @@ sdkconfig.old
 dependencies.lock
 .clangd
 *.log
+secure_boot_signing_key.pem
+managed_components/

@@ -1,0 +1,9 @@
+# Name,   Type, SubType,  Offset,     Size,     Flags
+# Used with sdkconfig.hardware-secure-boot only. The table sits at 0xD000, so everything starts
+# later than in partitions.csv, and nvs_keys holds the NVS encryption keys.
+nvs,      data, nvs,      0xE000,     0x5000,
+otadata,  data, ota,      0x13000,    0x2000,
+nvs_keys, data, nvs_keys, 0x15000,    0x1000,   encrypted
+app0,     app,  ota_0,    0x00020000, 0x1E0000,
+app1,     app,  ota_1,    0x00200000, 0x1E0000,
+coredump, data, coredump, 0x003E0000, 0x20000,  encrypted
