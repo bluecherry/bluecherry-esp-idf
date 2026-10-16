@@ -10,22 +10,30 @@ firmware updates signed with your own key. It demonstrates:
  - MQTT subscribe
  - OTA updates with signed firmware
 
-## What it protects
+It is meant to be used in two stages. The default build is for **development**: devices refuse
+unsigned updates, but nothing is burned into eFuse, so a board can always be erased and reused.
+**Before your first release** you turn on hardware secure boot, which also protects devices
+against someone with physical access, permanently.
 
-Every OTA image is checked before it is installed. An image that is unsigned, or signed with a
-different key, is refused: the device keeps running its current firmware and reports the failed
-update to BlueCherry.
+## What you can and cannot do
 
-This uses ESP-IDF's *Require signed app images* option with the Secure Boot V2 signature scheme
-(RSA-3072), but not hardware secure boot. **Nothing is burned into eFuse**, so a board can be erased
-and reused at any time.
+| | Default build (development) | Hardware secure boot (release) |
+|---|---|---|
+| OTA update signed with your key | Installed | Installed |
+| OTA update unsigned, or signed with another key | Refused | Refused |
+| Firmware flashed by cable | Anything, signed or not | Only signed firmware boots |
+| Checked by the chip at every boot | Nothing | The bootloader and the app |
+| Flash contents, including the credentials ZTP stores | Readable by anyone with a cable | Encrypted |
+| JTAG debugging | Available | Disabled |
+| Return the chip to stock | Any time, by erasing the flash | Never: the eFuses stay burned |
 
-What it does not protect against is someone with physical access: the bootloader does not check
-the app at boot, and anyone with a cable can still flash anything. That takes hardware secure boot,
-which this example can be switched to on purpose, see [Hardware secure boot](#hardware-secure-boot).
+A refused update leaves the device running its current firmware, and BlueCherry receives OTA
+error 7.
 
-A device trusts the key that signed the firmware it is running. The firmware you first flash
-therefore decides which key every later update has to carry.
+In the default build, a device trusts the key that signed the firmware it is running. The firmware
+you flash first therefore decides which key every later update has to carry. Flash unsigned
+firmware by cable and no key is trusted any more: every update is refused until signed firmware is
+flashed again.
 
 ## Hardware
 
@@ -36,14 +44,12 @@ Any ESP32-S3 with at least 4 MB of flash. The target is pinned to `esp32s3` in
 
 ```
 main/
-  main.c              the template's application, plus a report of the image hash at boot
+  main.c              the template's application, plus a report of the security state at boot
   wifi.c              network bring-up, nothing BlueCherry specific
   includes/wifi.h     WiFi credentials - edit this before building
   credentials/        device certificate and key, only for the pre-provisioned path
-sdkconfig.defaults    the signing configuration, at the bottom
-
-sdkconfig.hardware-secure-boot        opt-in only, burns eFuses: see Hardware secure boot
-partitions-hardware-secure-boot.csv   the partition table that goes with it
+sdkconfig.defaults    the signing configuration, and hardware secure boot commented out below it
+partitions.csv        two OTA slots, laid out so hardware secure boot fits without changes
 ```
 
 ## Getting started
@@ -65,13 +71,15 @@ while the key does not exist yet, and that configuration fails every build until
 At boot the application reports its state:
 
 ```
-I (...) EXAMPLE: Secure boot: DISABLED
-I (...) EXAMPLE: Flash encryption: DISABLED
+I (...) EXAMPLE: Hardware secure boot: disabled
+I (...) EXAMPLE: Flash encryption: disabled
+I (...) EXAMPLE: OTA updates: only installed when signed with a trusted key
 I (...) EXAMPLE: Running image in app0, SHA-256 <64 hex digits>
 ```
 
-Both read DISABLED on purpose: signatures are checked without hardware secure boot. The SHA-256 is
-the image's fingerprint, see [The fingerprint](#the-fingerprint).
+The first two lines read the chip's eFuses, which the default build leaves alone. The third is what
+the firmware enforces, eFuses or not. The SHA-256 is the image's fingerprint, see
+[The fingerprint](#the-fingerprint).
 
 ## The signing key
 
@@ -79,7 +87,7 @@ the image's fingerprint, see [The fingerprint](#the-fingerprint).
 safe: without it, devices in the field can no longer be updated over the air.
 
 The key belongs to the firmware, not to a device: every device running firmware signed with it
-accepts only updates signed with it.
+accepts only updates signed with it. Hardware secure boot uses the same key.
 
 ## Releasing an update
 
@@ -95,8 +103,7 @@ python -m espsecure sign_data --version 2 --keyfile secure_boot_signing_key.pem 
 ```
 
 The result is equivalent to the image the build signs. Only the signature bytes differ, since
-RSA-PSS signatures are randomised. Mind that the firmware you flash by cable has to be signed too,
-because its key is the one devices trust.
+RSA-PSS signatures are randomised.
 
 ## The fingerprint
 
@@ -122,50 +129,61 @@ The script also works on its own, on any ESP-IDF app image, signed or not:
 python managed_components/bluecherry__bluecherry/scripts/firmware_fingerprint.py build/wifi-template-self-signed.bin
 ```
 
-## Hardware secure boot
+## Before your first release: hardware secure boot
 
-Hardware secure boot adds what the default build leaves out: the chip verifies the bootloader and
-the bootloader verifies the app on every boot, flash encryption keeps the flash unreadable, and NVS
-encryption protects the credentials ZTP stores. It uses the same key, so firmware is signed and
-released exactly as above.
+The default build stops unsigned updates, not someone with a cable. Before devices leave your
+hands, turn on hardware secure boot: the chip then verifies the bootloader, and the bootloader the
+app, on every boot. Flash encryption keeps the flash, and the credentials in it, unreadable, and
+JTAG is disabled. Signing and releasing updates stay exactly as above, with the same key.
 
 > **This is permanent.** The first boot burns eFuses that can never be cleared. From then on the
-> chip only boots firmware signed with your `secure_boot_signing_key.pem`, and JTAG is disabled.
-> Lose the key and the chip can never take new firmware again. Try it on a board you can spare.
+> chip only boots firmware signed with your `secure_boot_signing_key.pem`. Lose the key and the
+> chip can never take new firmware again.
 
-None of this happens by accident: `sdkconfig.hardware-secure-boot` and
-`partitions-hardware-secure-boot.csv` are only used when you name them. With the signing key
-generated (see [Getting started](#getting-started)), in this directory:
+A device gets hardware secure boot when it is first flashed, never through an update: the
+bootloader enables it, and the bootloader cannot be updated over the air. Devices that ship
+without it stay without it.
 
-```bash
-rm -f sdkconfig
-idf.py fullclean
-idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.hardware-secure-boot" build
-grep "CONFIG_SECURE_BOOT=y" sdkconfig
-idf.py flash monitor
-```
+### Turning it on
 
-The `sdkconfig` has to go first, because an existing one overrides both files. The `grep` must
-print the line before you flash, or the opt-in did not take effect.
+Try it on a board you can spare first. None of this happens by accident: the settings sit at the
+bottom of `sdkconfig.defaults`, commented out, and `partitions.csv` already has room for them.
+With the signing key generated (see [Getting started](#getting-started)), in this directory:
+
+1. Uncomment the eight `CONFIG_` lines of the hardware secure boot block in `sdkconfig.defaults`.
+2. Build from a fresh configuration, check that it took, and flash:
+   ```bash
+   rm -f sdkconfig
+   idf.py fullclean
+   idf.py build
+   grep "CONFIG_SECURE_BOOT=y" sdkconfig
+   idf.py flash monitor
+   ```
+
+The `sdkconfig` has to go first, because an existing one overrides `sdkconfig.defaults`. The `grep`
+must print the line before you flash, or the change did not take effect.
 
 On the first boot the bootloader enables secure boot, encrypts the flash in place and restarts. It
 takes a moment longer than usual: **do not power the device off while it runs.** The application
-then reports `Secure boot: enabled` and `Flash encryption: development`.
+then reports `Hardware secure boot: enabled` and `Flash encryption: development`.
 
-From then on:
+Keep building that product's updates with this configuration. The `sdkconfig` you just made keeps
+it. An update built without it does not know NVS is encrypted, and cannot read what is stored
+there.
 
-- **Reflash by cable with `idf.py encrypted-app-flash`.** A plain `idf.py flash` writes plaintext
-  the chip can no longer boot. This is possible because flash encryption is in Development mode.
-- **Keep building this product's updates with the same configuration.** The `sdkconfig` you just
-  made keeps it. An update built without it looks for the partition table in the wrong place, and
-  the device rolls it back.
-- **For production**, replace `CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y` in
-  `sdkconfig.hardware-secure-boot` with `CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y`, and remove
-  `CONFIG_SECURE_FLASH_UART_BOOTLOADER_ALLOW_ENC=y`. Reflashing by cable is then impossible for
-  good, and OTA is the only way to update.
+### Development mode, then Release mode
 
-The bootloader enables all of this and cannot be updated over the air, so a device gets hardware
-secure boot when it is first flashed, never through an update. Espressif's
+The block turns flash encryption on in **Development mode**. The board can still be reflashed by
+cable, with `idf.py encrypted-app-flash`: a plain `idf.py flash` writes plaintext the chip can no
+longer boot. Use it to try your release on a board you can spare.
+
+For the devices you ship, switch to **Release mode**: in that block, replace
+`CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y` with
+`CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y`, and remove
+`CONFIG_SECURE_FLASH_UART_BOOTLOADER_ALLOW_ENC=y`. Reflashing by cable is then impossible for good,
+and OTA is the only way to update.
+
+Espressif's
 [Secure Boot V2](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/security/secure-boot-v2.html)
 and
 [flash encryption](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/security/flash-encryption.html)
@@ -178,8 +196,8 @@ guides cover the details.
 - **`idf.py secure-sign-data` or `idf.py secure-verify-signature` cannot find a file**: both run
   espsecure inside `build/`, so relative paths miss. Use `python -m espsecure` as shown above.
 - **The device refuses an update**: it logs `OTA: could not set the boot partition`, and BlueCherry
-  receives OTA error 7. The image is unsigned, or signed with a different key than the firmware the
-  device is running.
+  receives OTA error 7. The image is unsigned, or signed with a different key than the one the
+  device trusts.
 
 ## Licence
 

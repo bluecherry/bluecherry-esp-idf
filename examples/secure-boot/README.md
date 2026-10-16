@@ -10,5 +10,6 @@ Hardware secure boot is a separate, deliberate step, described in self-signed.
 | [self-signed](self-signed/wifi-template) | You, with your own key | Ready to use |
 | [bluecherry-signed](bluecherry-signed/wifi-template) | BlueCherry, after checking that the upload is yours | Concept, work in progress |
 
-Start with self-signed. It also explains how the fingerprint BlueCherry records for a signed image
-is found, and what hardware secure boot would add.
+Start with self-signed. It sets out what a device does and does not accept, how the fingerprint
+BlueCherry records for a signed image is found, and the step to take before your first release:
+turning on hardware secure boot.

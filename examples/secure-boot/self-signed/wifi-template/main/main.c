@@ -73,6 +73,10 @@ extern const char devkey[] asm("_binary_devkey_pem_start");
 /**
  * @brief Report the security state of this boot and the hash of the running image.
  *
+ * Hardware secure boot and flash encryption are read from eFuse. Whether OTA updates have to be
+ * signed is decided by the build: with signed app images required, an update is only installed when
+ * it is signed with a trusted key, with or without hardware secure boot.
+ *
  * The hash is the SHA-256 that ESP-IDF appends to the app image, and the one this device reports
  * to BlueCherry. Signing leaves it unchanged, because the signature sector is appended after it,
  * so it is also the fingerprint BlueCherry should have recorded for the uploaded image.
@@ -82,11 +86,16 @@ extern const char devkey[] asm("_binary_devkey_pem_start");
 static void log_security_state(void)
 {
   const esp_flash_enc_mode_t mode = esp_get_flash_encryption_mode();
-  ESP_LOGI(TAG, "Secure boot: %s", esp_secure_boot_enabled() ? "enabled" : "DISABLED");
+  ESP_LOGI(TAG, "Hardware secure boot: %s", esp_secure_boot_enabled() ? "enabled" : "disabled");
   ESP_LOGI(TAG, "Flash encryption: %s",
            mode == ESP_FLASH_ENC_MODE_RELEASE       ? "release"
            : mode == ESP_FLASH_ENC_MODE_DEVELOPMENT ? "development"
-                                                    : "DISABLED");
+                                                    : "disabled");
+#ifdef CONFIG_SECURE_SIGNED_ON_UPDATE
+  ESP_LOGI(TAG, "OTA updates: only installed when signed with a trusted key");
+#else
+  ESP_LOGW(TAG, "OTA updates: installed without a signature check");
+#endif
 
   const esp_partition_t* running = esp_ota_get_running_partition();
   uint8_t sha256[32];

@@ -1,6 +1,10 @@
-# Name,   Type, SubType, Offset,     Size, Flags
-nvs,      data, nvs,     0x9000,     0x5000,
-otadata,  data, ota,     0xE000,     0x2000,
-app0,     app,  ota_0,   0x00010000, 0x1F0000,
-app1,     app,  ota_1,   0x00200000, 0x1F0000,
-coredump, data, coredump,0x003F0000, 0x10000,
+# Name,   Type, SubType,  Offset,     Size,     Flags
+# The table sits at 0xD000 (CONFIG_PARTITION_TABLE_OFFSET) and nvs_keys is reserved, so hardware
+# secure boot can be turned on without changing this table. Without it, the extra bootloader room
+# and nvs_keys simply go unused.
+nvs,      data, nvs,      0xE000,     0x5000,
+otadata,  data, ota,      0x13000,    0x2000,
+nvs_keys, data, nvs_keys, 0x15000,    0x1000,   encrypted
+app0,     app,  ota_0,    0x00020000, 0x1E0000,
+app1,     app,  ota_1,    0x00200000, 0x1E0000,
+coredump, data, coredump, 0x003E0000, 0x20000,  encrypted

@@ -5,6 +5,7 @@ CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xD000
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
@@ -19,3 +20,21 @@ CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
 CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
 CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
 CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# Hardware secure boot: Secure Boot V2, flash encryption and NVS encryption. Commented out on
+# purpose, read "Hardware secure boot" in README.md before uncommenting the block below.
+#
+# PERMANENT. The first boot burns eFuses that can never be cleared: from then on the chip only
+# boots firmware signed with secure_boot_signing_key.pem, and JTAG is disabled.
+#
+# Uncommented, it takes over from the signed-apps-only lines above, which switch themselves off.
+# Flash encryption is in Development mode with encrypted flashing over UART left enabled, so the
+# device can still be reflashed by cable. NVS encryption protects the credentials ZTP stores.
+# CONFIG_SECURE_BOOT=y
+# CONFIG_SECURE_BOOT_V2_ENABLED=y
+# CONFIG_SECURE_BOOT_FLASH_BOOTLOADER_DEFAULT=y
+# CONFIG_SECURE_FLASH_ENC_ENABLED=y
+# CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+# CONFIG_SECURE_FLASH_UART_BOOTLOADER_ALLOW_ENC=y
+# CONFIG_NVS_ENCRYPTION=y
+# CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y
