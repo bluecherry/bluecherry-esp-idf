@@ -1,5 +1,5 @@
-# `idf.py fingerprint` prints the fingerprint BlueCherry records for this project's firmware: the
-# SHA-256 ESP-IDF appends to the app image, which is also what the device reports. For a signed
+# `idf.py fingerprint` prints the fingerprint of this project's firmware: the SHA-256 ESP-IDF
+# appends to the app image, which is also what the device reports. For a signed
 # image that is not the file's last 32 bytes, so scripts/firmware_fingerprint.py walks the image to
 # find it. The app is built first.
 if(NOT BOOTLOADER_BUILD)

@@ -1,6 +1,6 @@
 # @file firmware_fingerprint.py
 # @author Arnoud Devoogdt <arnoud@dptechnics.com>
-# @brief Print the fingerprint BlueCherry records for an ESP-IDF firmware image.
+# @brief Print the fingerprint of an ESP-IDF app image.
 # @version 1.4.0
 # @date 2026-10-16
 # @copyright Copyright (c) 2026 DPTechnics BV <info@dptechnics.com>
@@ -16,25 +16,14 @@
 # You should have received a copy of the GNU Lesser General Public License along with this program.
 # If not, see <https://www.gnu.org/licenses/lgpl-3.0.html>.
 
-"""Print the fingerprint BlueCherry records for an ESP-IDF firmware image.
+"""Print the fingerprint of an ESP-IDF app image, signed or not.
 
-BlueCherry identifies firmware by the SHA-256 that ESP-IDF appends to every app image. It is what
-the platform stores when an update is uploaded, and what a device reports for the firmware it runs.
-
-The hash sits right after the image's checksum. An unsigned image ends there, so it is the file's
-last 32 bytes. A signed image does not: Secure Boot V2 signing appends a 4 KB signature sector after
-the hash, mostly 0xFF. This tool walks the image from its header instead, which finds the hash in
-both cases, verifies it against the image, and explains whatever follows it.
-
-Anything that is not a single ESP-IDF app image is rejected: a bootloader, a merged flash image, a
-truncated or corrupted file, or data appended after the image that is not a signature sector.
+The fingerprint is the SHA-256 ESP-IDF appends to the image. Anything that is not a single, intact
+app image is rejected.
 
 usage: python firmware_fingerprint.py [-q] FIRMWARE.bin [FIRMWARE.bin ...]
 
-  -q   print only the fingerprint (with the file name when given several files), reasons for a
-       rejection go to stderr. Exits 1 if any file was rejected.
-
-In a project that uses the library, `idf.py fingerprint` runs this on the project's own image.
+  -q   print only the fingerprint. Exits 1 if any file was rejected.
 """
 
 import hashlib
@@ -128,15 +117,13 @@ def fingerprint(data):
                             "flash image that starts with one")
     trailer = describe_trailer(data, hash_off + HASH_LEN)
 
-    tail = data[-HASH_LEN:]
     report = [
         ("size", f"{len(data)} bytes"),
         ("app", f"'{_cstr(data[80:112])}' version '{_cstr(data[48:80])}', "
                 f"ESP-IDF {_cstr(data[144:176])}, {data[1]} segments"),
         ("hash", f"at 0x{hash_off:06x}, matches the image"),
         ("after it", trailer),
-        ("tail -c 32", tail.hex()),
-        ("fingerprint", digest.hex() + ("" if tail == digest else "   <- differs from the tail")),
+        ("fingerprint", digest.hex()),
     ]
     return digest, report
 
