@@ -3136,19 +3136,21 @@ fail:
  * @brief Reserve everything both entry points need, without touching the network.
  *
  * Raises the OTA events that belong to this boot, then reserves the publish buffer, sets up the
- * Mbed TLS contexts and the CA chain, configures the watchdog and starts the synchronisation
- * task. The caller supplies the state to settle in, which is the only thing that differs between
- * a pre-provisioned device and one that still has to be provisioned.
+ * Mbed TLS contexts, the CA chain and the device credentials when there are any, configures the
+ * watchdog and starts the synchronisation task. Credentials are the only thing that differs
+ * between a pre-provisioned device and one that still has to be provisioned.
  *
+ * @param device_cert The device certificate in PEM format, or NULL to provision this device.
+ * @param device_key The device certificate's key in PEM format, or NULL with device_cert.
+ * @param interval_sec Seconds between automatic synchronisations, or 0 for none.
  * @param watchdog_timeout_seconds The task watchdog timeout in seconds, or 0 to leave it alone.
  * @param publish_buffer The application's publish buffer, or NULL to allocate one.
- * @param initial_state The state to leave the library in on success.
  *
  * @return ESP_OK on success, ESP_FAIL otherwise.
  */
-static esp_err_t _bluecherry_init_common(uint16_t watchdog_timeout_seconds,
-                                         const bluecherry_publish_buffer_t* publish_buffer,
-                                         bluecherry_state initial_state)
+static esp_err_t _bluecherry_init_common(const char* device_cert, const char* device_key,
+                                         uint32_t interval_sec, uint16_t watchdog_timeout_seconds,
+                                         const bluecherry_publish_buffer_t* publish_buffer)
 {
   /* Not 0: that is a valid descriptor, and the first cleanup would close it. */
   _bluecherry_opdata.sock = -1;
@@ -3173,6 +3175,10 @@ static esp_err_t _bluecherry_init_common(uint16_t watchdog_timeout_seconds,
   }
   if(!_bluecherry_configure_ca(BLUECHERRY_CA)) {
     ESP_LOGE(TAG, "Could not configure the CA chain");
+    goto fail;
+  }
+  if(device_cert != NULL && !_bluecherry_configure_own_cert(device_cert, device_key)) {
+    ESP_LOGE(TAG, "Could not configure device credentials");
     goto fail;
   }
 
@@ -3208,11 +3214,17 @@ static esp_err_t _bluecherry_init_common(uint16_t watchdog_timeout_seconds,
     }
   }
 
-  _bluecherry_set_state(initial_state);
+  _bluecherry_set_state(device_cert != NULL ? BLUECHERRY_STATE_AWAIT_CONNECTION
+                                            : BLUECHERRY_STATE_NOT_PROVISIONED);
 
   /* Deliberately without a first cycle. An exchange the application did not ask for costs it
    * data, raises state changes it has no reason to expect, and can come before its network is up.
-   * The first one waits for a sync request or automatic synchronisation. */
+   * The first one waits for a sync request or automatic synchronisation, which enabling it below
+   * starts. Last, so the state and credentials are in place when it does. */
+  if(interval_sec > 0) {
+    bluecherry_set_auto_sync(interval_sec);
+  }
+
   return ESP_OK;
 
 fail:
@@ -3236,24 +3248,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t ret = _bluecherry_init_common(watchdog_timeout_seconds, publish_buffer,
-                                          BLUECHERRY_STATE_AWAIT_CONNECTION);
-  if(ret != ESP_OK) {
-    return ret;
-  }
-
-  if(!_bluecherry_configure_own_cert(device_cert, device_key)) {
-    ESP_LOGE(TAG, "Could not configure device credentials");
-    _bluecherry_set_state(BLUECHERRY_STATE_UNINITIALIZED);
-    return ESP_FAIL;
-  }
-
-  /* Last, once the credentials are in: enabling it starts the first synchronisation. */
-  if(interval_sec > 0) {
-    bluecherry_set_auto_sync(interval_sec);
-  }
-
-  return ESP_OK;
+  return _bluecherry_init_common(device_cert, device_key, interval_sec, watchdog_timeout_seconds,
+                                 publish_buffer);
 }
 
 esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
@@ -3277,18 +3273,8 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
   /* Nothing here talks to the network. Reading the stored credentials and, if there are none,
    * provisioning this device both happen on the first synchronisation - so this call cannot
    * fail because the cloud is unreachable, and the caller does not have to retry it. */
-  esp_err_t ret = _bluecherry_init_common(watchdog_timeout_seconds, publish_buffer,
-                                          BLUECHERRY_STATE_NOT_PROVISIONED);
-  if(ret != ESP_OK) {
-    return ret;
-  }
-
-  /* Last, once the state is set: enabling it starts the first synchronisation. */
-  if(interval_sec > 0) {
-    bluecherry_set_auto_sync(interval_sec);
-  }
-
-  return ESP_OK;
+  return _bluecherry_init_common(NULL, NULL, interval_sec, watchdog_timeout_seconds,
+                                 publish_buffer);
 }
 
 /**
