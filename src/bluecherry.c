@@ -197,6 +197,15 @@ static portMUX_TYPE _bluecherry_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool _sync_requested = false;
 
 /**
+ * @brief Whether the application has started synchronising.
+ *
+ * Set by the task when it runs a cycle, which only a sync request or an automatic synchronisation
+ * makes it do. Until then a missing session or missing credentials are no reason to run one: init
+ * leaves the network alone, and the application decides when its network is ready.
+ */
+static bool _sync_started = false;
+
+/**
  * @brief Tickle the task watchdog if enabled.
  *
  * This function tickles the task watchdog if it is enabled.
@@ -206,6 +215,24 @@ static void _bluecherry_tickle_watchdog(void)
   if(_watchdog) {
     esp_task_wdt_reset();
   }
+}
+
+/**
+ * @brief Whether there is a network stack to synchronise over.
+ *
+ * Every socket call goes through lwIP, which aborts the device when used before esp_netif_init.
+ * A network interface can only be created after that, so having one is the proof.
+ *
+ * @return True when a network interface exists, false after logging that none does.
+ */
+static bool _bluecherry_netif_ready(void)
+{
+  if(esp_netif_get_nr_of_ifs() > 0) {
+    return true;
+  }
+
+  ESP_LOGE(TAG, "No network interface, initialize the network stack before synchronising");
+  return false;
 }
 
 /**
@@ -579,18 +606,27 @@ static uint32_t _bluecherry_sync_wait_ms(void)
 /**
  * @brief Whether a cycle is due without anything having asked for one.
  *
- * The wait is capped so the watchdog stays fed, so it expiring says nothing about whether
- * there is work: this is the actual test. Provisioning and connecting are always due, because
- * their own backoff gates decide whether the cycle does anything.
+ * The wait is capped so the watchdog stays fed, so it expiring says nothing about whether there is
+ * work: this is the actual test. An automatic synchronisation is due in any state. Provisioning
+ * and connecting are retried on their own backoff gates, but only once synchronisation has started.
  *
  * @return True when the task should run a cycle of its own accord.
  */
 static bool _bluecherry_sync_due(void)
 {
-  switch(_bluecherry_opdata.state) {
-  case BLUECHERRY_STATE_UNINITIALIZED:
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_UNINITIALIZED) {
     return false;
+  }
 
+  if(_auto_sync_interval_sec > 0 && esp_timer_get_time() >= _next_auto_sync_us) {
+    return true;
+  }
+
+  if(!_sync_started) {
+    return false;
+  }
+
+  switch(_bluecherry_opdata.state) {
   case BLUECHERRY_STATE_NOT_PROVISIONED:
     return esp_timer_get_time() >= _next_provision_us;
 
@@ -598,10 +634,8 @@ static bool _bluecherry_sync_due(void)
     return true;
 
   default:
-    break;
+    return false;
   }
-
-  return _auto_sync_interval_sec > 0 && esp_timer_get_time() >= _next_auto_sync_us;
 }
 
 /**
@@ -625,8 +659,9 @@ static void _bluecherry_ota_service_requests(void);
  * @brief The entrypoint of the BlueCherry synchronisation task.
  *
  * Owns every network operation the library performs, and all the timing around them. It runs a
- * cycle when something triggers one, when an automatic synchronisation falls due, or when the
- * previous cycle finished with work still outstanding; otherwise it waits.
+ * cycle when something triggers one, when an automatic synchronisation falls due, when the
+ * previous cycle finished with work still outstanding, or, once synchronisation has started, to
+ * retry provisioning or the connection; otherwise it waits.
  *
  * @param args A NULL pointer.
  */
@@ -655,6 +690,8 @@ static void _bluecherry_sync_task(void* args)
     if(triggered == 0 && !_bluecherry_sync_due()) {
       continue;
     }
+
+    _sync_started = true;
 
     /* Cleared as the cycle starts rather than when it ends, so a publish or a sync that arrives
      * while this one is running still holds the state out of idle afterwards. */
@@ -1998,6 +2035,10 @@ static bool _bluecherry_dtls_connect(const char* host, const char* port)
 
   _bluecherry_cleanup_session();
 
+  if(!_bluecherry_netif_ready()) {
+    return false;
+  }
+
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
 
@@ -3099,17 +3140,19 @@ fail:
  * task. The caller supplies the state to settle in, which is the only thing that differs between
  * a pre-provisioned device and one that still has to be provisioned.
  *
- * @param interval_sec Seconds between automatic synchronisations, or 0 for none.
  * @param watchdog_timeout_seconds The task watchdog timeout in seconds, or 0 to leave it alone.
  * @param publish_buffer The application's publish buffer, or NULL to allocate one.
  * @param initial_state The state to leave the library in on success.
  *
  * @return ESP_OK on success, ESP_FAIL otherwise.
  */
-static esp_err_t _bluecherry_init_common(uint32_t interval_sec, uint16_t watchdog_timeout_seconds,
+static esp_err_t _bluecherry_init_common(uint16_t watchdog_timeout_seconds,
                                          const bluecherry_publish_buffer_t* publish_buffer,
                                          bluecherry_state initial_state)
 {
+  /* Not 0: that is a valid descriptor, and the first cleanup would close it. */
+  _bluecherry_opdata.sock = -1;
+
   _bluecherry_ota_check_boot();
 
   uint8_t mac[6];
@@ -3165,14 +3208,11 @@ static esp_err_t _bluecherry_init_common(uint32_t interval_sec, uint16_t watchdo
     }
   }
 
-  if(interval_sec > 0) {
-    bluecherry_set_auto_sync(interval_sec);
-  }
-
   _bluecherry_set_state(initial_state);
 
-  /* There is always something to do here, so start the first cycle rather than wait it out. */
-  xTaskNotifyGive(_sync_task);
+  /* Deliberately without a first cycle. An exchange the application did not ask for costs it
+   * data, raises state changes it has no reason to expect, and can come before its network is up.
+   * The first one waits for a sync request or automatic synchronisation. */
   return ESP_OK;
 
 fail:
@@ -3196,7 +3236,7 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t ret = _bluecherry_init_common(interval_sec, watchdog_timeout_seconds, publish_buffer,
+  esp_err_t ret = _bluecherry_init_common(watchdog_timeout_seconds, publish_buffer,
                                           BLUECHERRY_STATE_AWAIT_CONNECTION);
   if(ret != ESP_OK) {
     return ret;
@@ -3206,6 +3246,11 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
     ESP_LOGE(TAG, "Could not configure device credentials");
     _bluecherry_set_state(BLUECHERRY_STATE_UNINITIALIZED);
     return ESP_FAIL;
+  }
+
+  /* Last, once the credentials are in: enabling it starts the first synchronisation. */
+  if(interval_sec > 0) {
+    bluecherry_set_auto_sync(interval_sec);
   }
 
   return ESP_OK;
@@ -3230,10 +3275,20 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
   _bluecherry_opdata.ztp_bio_handler_args = ztp_bio_handler_args;
 
   /* Nothing here talks to the network. Reading the stored credentials and, if there are none,
-   * provisioning this device both happen on the first bluecherry_sync - so this call cannot
+   * provisioning this device both happen on the first synchronisation - so this call cannot
    * fail because the cloud is unreachable, and the caller does not have to retry it. */
-  return _bluecherry_init_common(interval_sec, watchdog_timeout_seconds, publish_buffer,
-                                 BLUECHERRY_STATE_NOT_PROVISIONED);
+  esp_err_t ret = _bluecherry_init_common(watchdog_timeout_seconds, publish_buffer,
+                                          BLUECHERRY_STATE_NOT_PROVISIONED);
+  if(ret != ESP_OK) {
+    return ret;
+  }
+
+  /* Last, once the state is set: enabling it starts the first synchronisation. */
+  if(interval_sec > 0) {
+    bluecherry_set_auto_sync(interval_sec);
+  }
+
+  return ESP_OK;
 }
 
 /**
@@ -3606,6 +3661,10 @@ esp_err_t bluecherry_sync(void)
     return ESP_ERR_INVALID_STATE;
   }
 
+  if(!_bluecherry_netif_ready()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
   /* Same reason as in bluecherry_publish: the caller has asked for an exchange, so the state has
    * to say one is outstanding before this returns. Waiting for the task to say so leaves a window
    * in which the previous cycle's idle is still showing, and that window is the whole scheduling
@@ -3627,10 +3686,10 @@ esp_err_t bluecherry_set_auto_sync(uint32_t interval_sec)
   _bluecherry_arm_auto_sync();
 
   if(interval_sec > 0) {
-    /* Only when the new interval leaves one already overdue. Setting a schedule is not the
-     * same as asking for a synchronisation, and anything still in the future is picked up by
-     * the task's next wake anyway. */
-    if(esp_timer_get_time() >= _next_auto_sync_us) {
+    /* Run one now if the new interval leaves one overdue, or if synchronisation has not started
+     * yet: enabling it is then what starts it. Anything still in the future is picked up by the
+     * task's next wake. */
+    if(!_sync_started || esp_timer_get_time() >= _next_auto_sync_us) {
       xTaskNotifyGive(_sync_task);
     }
     ESP_LOGI(TAG, "Automatic synchronisation every %lu s", interval_sec);

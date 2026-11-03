@@ -43,6 +43,7 @@
 #include <mbedtls/pk.h>
 #include <esp_system.h>
 #include <esp_random.h>
+#include <esp_netif.h>
 #include <esp_timer.h>
 #include <esp_attr.h>
 #include <inttypes.h>
@@ -1165,9 +1166,10 @@ typedef struct {
 /**
  * @brief Initialize the BlueCherry subsystem with an existing device certificate.
  *
- * Reserves the publish buffer, the TLS contexts and the synchronisation task. It does not touch
- * the network: the connection is established by the first bluecherry_sync, so this call cannot
- * fail because the cloud is unreachable.
+ * Reserves the publish buffer, the TLS contexts and the synchronisation task, and does not touch
+ * the network, so it cannot fail because the cloud is unreachable. The connection is made by the
+ * first synchronisation: with interval_sec set that one starts right away, with 0 it waits for
+ * bluecherry_sync. Bring the network stack up before either.
  *
  * Before returning it raises BLUECHERRY_OTA_EVENT_FIRSTBOOT, and
  * BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE for a download a deep sleep interrupted, so register the
@@ -1195,9 +1197,9 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
  *
  * Reserves the same resources and raises the same OTA events as bluecherry_init, then returns.
  * Reading the stored credentials, and provisioning this device when there are none, both happen
- * on the first bluecherry_sync - so this call does not touch the network and does not need to be
- * retried in a loop. A provisioning failure is reported by bluecherry_sync instead, which keeps
- * trying with a growing back-off.
+ * on the first synchronisation, which starts as for bluecherry_init - so this call does not touch
+ * the network and does not need to be retried in a loop. A provisioning failure is logged instead,
+ * and retried with a growing back-off.
  *
  * @param ztp_bio_handler The handler used for reading/writing keys and certificates. This must be
  * implemented by the application.
@@ -1234,7 +1236,12 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  * Because nothing is reported back, an application that needs to know when the exchange settled
  * waits for BLUECHERRY_STATE_IDLE, through bluecherry_get_state or a state handler.
  *
- * @return ESP_OK when the task was signalled, ESP_ERR_INVALID_STATE before bluecherry_init.
+ * Without automatic synchronisation, the first call is what connects: initialization does not.
+ * It needs the network stack up, with a network interface created through esp_netif. Without one
+ * the task is not signalled, and the error is logged.
+ *
+ * @return ESP_OK when the task was signalled, ESP_ERR_INVALID_STATE before bluecherry_init or
+ * while no network interface exists.
  */
 esp_err_t bluecherry_sync(void);
 
@@ -1254,6 +1261,10 @@ esp_err_t bluecherry_sync(void);
  * Seconds, not milliseconds, on purpose - this paces traffic to the platform, and anything
  * faster would only load it. It does not throttle the task's own behaviour: a cycle that ends
  * with work outstanding is followed immediately by another, regardless of this setting.
+ *
+ * Enabling it before synchronisation has started starts the first one now. Like bluecherry_sync,
+ * that needs a network interface; while there is none, each attempt logs the same error and is
+ * retried on the connection back-off.
  *
  * @param interval_sec Seconds between automatic synchronisations, or 0 to stop them and leave
  * synchronisation entirely to bluecherry_sync.

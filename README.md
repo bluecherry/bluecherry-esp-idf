@@ -94,6 +94,13 @@ returns. A background task talks to the cloud, at least every interval given to 
 and as soon as something is published. Pass `0` to leave the timing to your own `bluecherry_sync`
 calls, and use `bluecherry_set_auto_sync` to change the interval at runtime.
 
+Nothing reaches the network before the first synchronisation. With an interval set, that one starts
+as soon as `bluecherry_init` returns; with `0` it waits for your first `bluecherry_sync`. Either way
+the network stack has to be initialized by then: without a network interface `bluecherry_sync`
+returns `ESP_ERR_INVALID_STATE`, and automatic synchronisation logs the same error and keeps
+retrying. If your network comes up after initialization, pass `0` and call `bluecherry_sync`, or
+`bluecherry_set_auto_sync`, once it is.
+
 `bluecherry_sync` only signals that task and returns; it does not wait for the exchange. To know
 that a message has actually left, wait for `BLUECHERRY_STATE_IDLE` through `bluecherry_get_state`
 or `bluecherry_set_state_handler` - which is also the moment it is safe to sleep.
