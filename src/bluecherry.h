@@ -191,15 +191,6 @@ extern "C" {
 #define BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS 3
 
 /**
- * @brief Bytes skipped at the head of a ZTP CoAP response.
- *
- * The ZTP exchange does not parse its responses; it skips a fixed header and treats the
- * remainder as the CBOR payload. Any change to the server's response header silently
- * corrupts the payload, so this constant is a contract with the ZTP service.
- */
-#define BLUECHERRY_ZTP_RSP_HEADER_LEN 7
-
-/**
  * @brief The size of the ZTP transmit buffer.
  *
  * Sized to hold the largest ZTP request, which is the CSR: a CoAP header, the payload
@@ -327,8 +318,39 @@ typedef enum {
  */
 typedef enum {
   BLUECHERRY_COAP_RSP_VALID = 0x43,
+  BLUECHERRY_COAP_RSP_CONTENT = 0x45, /* 2.05, what the provisioning service answers with */
   BLUECHERRY_COAP_RSP_CONTINUE = 0x61
 } _bluecherry_coap_response;
+
+/**
+ * @brief The header of a received CoAP message, and where its payload starts.
+ */
+typedef struct {
+  /**
+   * @brief The message type, a _bluecherry_coap_type.
+   */
+  uint8_t type;
+
+  /**
+   * @brief The response code.
+   */
+  uint8_t code;
+
+  /**
+   * @brief The message ID.
+   */
+  uint16_t msg_id;
+
+  /**
+   * @brief Offset of the payload, or the length of the message when there is none.
+   */
+  size_t payload;
+
+  /**
+   * @brief Whether the message carries the payload marker.
+   */
+  bool marker;
+} _bluecherry_coap_meta_t;
 
 /**
  * @brief The possible types of BlueCherry events.
@@ -732,19 +754,18 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.07;
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
 
 /**
- * @brief The initial delay between provisioning attempts.
+ * @brief The delay after a first failed attempt to provision or connect, in milliseconds.
+ *
+ * It doubles on every further failure up to BLUECHERRY_RETRY_MAX_MS and drops back once an
+ * attempt succeeds. Provisioning and connecting share it, because they never overlap: a device
+ * cannot connect before it is provisioned, and once it is, it never provisions again.
  */
-#define BLUECHERRY_PROVISION_RETRY_MS 8000
+#define BLUECHERRY_RETRY_MIN_MS 100
 
 /**
- * @brief The ceiling for the delay between provisioning attempts.
- *
- * The delay runs 8s, 16s, 32s, 64s and is then held there. Every attempt is a full DTLS
- * handshake against the provisioning service, so an unprovisioned device retrying faster than
- * this only loads that service - and unlike a dropped CoAP message there is nothing to gain
- * from reacting quickly. A device provisions once in its life; a minute is nothing.
+ * @brief The ceiling for the delay between attempts to provision or connect, in milliseconds.
  */
-#define BLUECHERRY_PROVISION_RETRY_MAX_MS 64000
+#define BLUECHERRY_RETRY_MAX_MS 30000
 
 /**
  * @brief The longest the synchronisation task will sleep while waiting for something to do.
@@ -1046,11 +1067,6 @@ typedef struct {
    * @brief The last CoAP message id that was acknowledged from the cloud.
    */
   uint16_t last_acked_message_id;
-
-  /**
-   * @brief The last CoAP transmission time.
-   */
-  time_t last_tx_time;
 
   /**
    * @brief The length of the last incoming buffer data.

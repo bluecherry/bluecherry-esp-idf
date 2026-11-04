@@ -105,11 +105,17 @@ VYg4UI2D74WfVxn+NyVd2/aXTvSBp8VgyV3odA==\r\n\
 static bool _watchdog = false;
 
 /**
- * @brief When the next provisioning attempt is due, or 0 for "due now".
+ * @brief When the next attempt to provision or connect is due, or 0 for "due now".
  *
- * At file scope because the task reads it to decide how long it can wait.
+ * One back-off serves both: a device cannot connect before it is provisioned, and once it is, it
+ * never provisions again. At file scope because the task reads it to decide how long it can wait.
  */
-static int64_t _next_provision_us = 0;
+static int64_t _next_attempt_us = 0;
+
+/**
+ * @brief The delay applied after the next failed attempt.
+ */
+static uint32_t _retry_interval_ms = BLUECHERRY_RETRY_MIN_MS;
 
 /**
  * @brief The synchronisation task, or NULL before bluecherry_init.
@@ -572,10 +578,51 @@ static void _bluecherry_settle_state(void)
 }
 
 /**
+ * @brief Hold the next attempt to provision or connect off after one failed.
+ *
+ * The delay doubles on every failure, up to BLUECHERRY_RETRY_MAX_MS.
+ *
+ * @return The delay applied, in milliseconds.
+ */
+static uint32_t _bluecherry_retry_later(void)
+{
+  uint32_t delay_ms = _retry_interval_ms;
+
+  _next_attempt_us = esp_timer_get_time() + (int64_t) delay_ms * 1000;
+  _retry_interval_ms =
+      delay_ms >= BLUECHERRY_RETRY_MAX_MS / 2 ? BLUECHERRY_RETRY_MAX_MS : delay_ms * 2;
+
+  return delay_ms;
+}
+
+/**
+ * @brief Make the next attempt to provision or connect due at once, after one succeeded.
+ *
+ * @return None.
+ */
+static void _bluecherry_retry_reset(void)
+{
+  _next_attempt_us = 0;
+  _retry_interval_ms = BLUECHERRY_RETRY_MIN_MS;
+}
+
+/**
+ * @brief Whether the task is retrying provisioning or the connection.
+ *
+ * @return True while either is outstanding for a synchronisation that has started.
+ */
+static bool _bluecherry_retrying(void)
+{
+  return _sync_started && (_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED ||
+                           _bluecherry_opdata.state == BLUECHERRY_STATE_AWAIT_CONNECTION);
+}
+
+/**
  * @brief How long the synchronisation task may wait before running the next cycle.
  *
- * The next deadline it knows about: a provisioning retry or the auto-sync interval. Capped at
- * BLUECHERRY_SYNC_IDLE_MAX_MS so the watchdog cannot be starved. A trigger cuts the wait short.
+ * The next deadline it knows about: a retry of provisioning or the connection, or the auto-sync
+ * interval. Capped at BLUECHERRY_SYNC_IDLE_MAX_MS so the watchdog cannot be starved. A trigger
+ * cuts the wait short.
  *
  * @return The number of milliseconds to wait.
  */
@@ -583,8 +630,8 @@ static uint32_t _bluecherry_sync_wait_ms(void)
 {
   int64_t deadline_us = 0;
 
-  if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
-    deadline_us = _next_provision_us;
+  if(_bluecherry_retrying()) {
+    deadline_us = _next_attempt_us;
   } else if(_auto_sync_interval_sec > 0) {
     deadline_us = _next_auto_sync_us;
   }
@@ -608,7 +655,7 @@ static uint32_t _bluecherry_sync_wait_ms(void)
  *
  * The wait is capped so the watchdog stays fed, so it expiring says nothing about whether there is
  * work: this is the actual test. An automatic synchronisation is due in any state. Provisioning
- * and connecting are retried on their own backoff gates, but only once synchronisation has started.
+ * and connecting are retried on the back-off, but only once synchronisation has started.
  *
  * @return True when the task should run a cycle of its own accord.
  */
@@ -622,20 +669,7 @@ static bool _bluecherry_sync_due(void)
     return true;
   }
 
-  if(!_sync_started) {
-    return false;
-  }
-
-  switch(_bluecherry_opdata.state) {
-  case BLUECHERRY_STATE_NOT_PROVISIONED:
-    return esp_timer_get_time() >= _next_provision_us;
-
-  case BLUECHERRY_STATE_AWAIT_CONNECTION:
-    return true;
-
-  default:
-    return false;
-  }
+  return _bluecherry_retrying() && esp_timer_get_time() >= _next_attempt_us;
 }
 
 /**
@@ -2128,59 +2162,162 @@ cleanup:
 #pragma endregion
 #pragma region CoAP RXTX
 /**
- * @brief Parse the ACK message ID from a received CoAP packet.
+ * @brief Parse the header of a received CoAP message.
  *
- * @param buf Pointer to the input packet buffer.
- * @param len Number of bytes in the packet buffer.
- * @param type Output pointer for the packet type.
- * @param msg_id Output pointer for the parsed message ID.
+ * Reads the fixed header, skips the token and any options, and finds the payload. The cloud
+ * connection and provisioning both go through it, so it accepts what either service sends.
  *
- * @return ESP_OK if parsing succeeded.
+ * @param buf The received message.
+ * @param len The number of bytes in buf.
+ * @param meta Filled in with the header fields and the payload offset.
+ *
+ * @return ESP_OK when the message is well formed, ESP_ERR_INVALID_VERSION or ESP_ERR_INVALID_SIZE
+ * otherwise.
  */
-static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len, uint8_t* type,
-                                            uint16_t* msg_id)
+static esp_err_t _bluecherry_coap_parse(const uint8_t* buf, size_t len,
+                                        _bluecherry_coap_meta_t* meta)
 {
   if(len < 4) {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  size_t offset = 0;
-  uint8_t header = buf[offset++];
-  uint8_t version = (header >> 6) & 0x03;
-  if(version != 1) {
+  if((buf[0] >> 6) != 1) {
     return ESP_ERR_INVALID_VERSION;
   }
 
-  *type = (header >> 4) & 0x03;
-  uint8_t token_len = header & 0x0F;
-
-  if(len < (size_t) (4 + token_len)) {
+  /* The token follows the 4 byte fixed header. */
+  size_t token_len = buf[0] & 0x0F;
+  if(token_len > 8 || 4 + token_len > len) {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  offset += token_len;
-  offset++; // code
+  meta->type = (buf[0] >> 4) & 0x03;
+  meta->code = buf[1];
+  meta->msg_id = (uint16_t) ((buf[2] << 8) | buf[3]);
 
-  *msg_id = buf[offset++];
-  *msg_id <<= 8;
-  *msg_id |= buf[offset++];
+  /* Options run up to the payload marker or the end. Only their sizes matter here. */
+  size_t offset = 4 + token_len;
+  while(offset < len && buf[offset] != 0xFF) {
+    uint8_t delta = buf[offset] >> 4;
+    size_t opt_len = buf[offset] & 0x0F;
+    offset++;
 
+    if(delta == 15 || opt_len == 15) {
+      return ESP_ERR_INVALID_SIZE;
+    }
+
+    offset += delta == 13 ? 1 : delta == 14 ? 2 : 0;
+
+    if(opt_len == 13) {
+      if(offset + 1 > len) {
+        return ESP_ERR_INVALID_SIZE;
+      }
+      opt_len = 13 + buf[offset];
+      offset += 1;
+    } else if(opt_len == 14) {
+      if(offset + 2 > len) {
+        return ESP_ERR_INVALID_SIZE;
+      }
+      opt_len = 269 + (((size_t) buf[offset] << 8) | buf[offset + 1]);
+      offset += 2;
+    }
+
+    offset += opt_len;
+    if(offset > len) {
+      return ESP_ERR_INVALID_SIZE;
+    }
+  }
+
+  meta->marker = offset < len;
+  meta->payload = meta->marker ? offset + 1 : len;
   return ESP_OK;
 }
 
 /**
- * @brief Perform CoAP transmit and receive operations with the BlueCherry cloud.
+ * @brief Send one confirmable CoAP message and wait for its acknowledgement.
  *
- * This function will calculate and add the correct CoAP header to the message buffer and transmit
- * the data over the the Mbed TLS DTLS socket. The message buffer must have a free space of
- * BLUECHERRY_COAP_HEADER_SIZE preceeding the valid data. After the buffer is transmitted the
- * function will try to read the acknowledgement and new data coming from the cloud.
+ * The one retransmission loop, shared by the cloud connection and provisioning. Sends at most
+ * BLUECHERRY_MAX_RETRANSMITS times, waiting BLUECHERRY_ACK_TIMEOUT times a random factor and
+ * doubling that per attempt. Anything that is not the ACK for msg_id is ignored, so a late reply
+ * to an earlier request is never taken for the reply to this one.
  *
- * @param msg The message to send or NULL to send empty sync packet.
+ * Per RFC 7252 an acknowledgement repeating a message ID already handled is a retransmission, or
+ * the answer to one, so discarding it is correct. Reading it out is what keeps it from being
+ * handed over in place of the next exchange's answer.
  *
- * @return ESP_OK on success.
+ * Leaves the connection state alone: provisioning runs in BLUECHERRY_STATE_NOT_PROVISIONED and
+ * has to stay there.
+ *
+ * @param data The complete message, header included.
+ * @param len The length of data.
+ * @param msg_id The message ID in the header of data.
+ * @param meta Filled in with the header fields of the acknowledgement.
+ *
+ * @return ESP_OK with the acknowledgement in in_buf, ESP_FAIL when the connection failed, or
+ * ESP_ERR_TIMEOUT when no acknowledgement came.
  */
-static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
+static esp_err_t _bluecherry_coap_exchange(const uint8_t* data, size_t len, uint16_t msg_id,
+                                           _bluecherry_coap_meta_t* meta)
+{
+  int64_t timeout_us =
+      (int64_t) (BLUECHERRY_ACK_TIMEOUT * 1000000 *
+                 (1 + (esp_random() / 4294967296.0) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1)));
+
+  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
+    /* Monotonic, so that a clock step mid exchange cannot make the deadline expire instantly or
+     * never. */
+    int64_t deadline_us = esp_timer_get_time() + timeout_us;
+    _bluecherry_tickle_watchdog();
+
+    if(_bluecherry_mbed_dtls_write(data, len) < 0) {
+      return ESP_FAIL;
+    }
+
+    /* Checked after every read, so a stream of datagrams that are not the ACK cannot hold the
+     * deadline off. */
+    while(esp_timer_get_time() < deadline_us) {
+      int ret =
+          _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, sizeof(_bluecherry_opdata.in_buf));
+      if(ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+        continue;
+      }
+      if(ret <= 0) {
+        return ESP_FAIL;
+      }
+
+      _bluecherry_opdata.in_buf_len = ret;
+
+      if(_bluecherry_coap_parse(_bluecherry_opdata.in_buf, _bluecherry_opdata.in_buf_len, meta) !=
+         ESP_OK) {
+        ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
+      } else if(meta->type != BLUECHERRY_COAP_TYPE_ACK) {
+        ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
+      } else if(meta->msg_id != msg_id) {
+        ESP_LOGD(TAG, "Ignoring ACK for message %u while awaiting %u", (unsigned) meta->msg_id,
+                 (unsigned) msg_id);
+      } else {
+        return ESP_OK;
+      }
+    }
+
+    timeout_us *= 2;
+  }
+
+  return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief Exchange one message with the BlueCherry cloud.
+ *
+ * Writes the CoAP header into the BLUECHERRY_COAP_HEADER_SIZE bytes reserved in front of the
+ * message and runs the exchange. The message ID is only committed once the cloud acknowledged it.
+ *
+ * @param msg The message to send, or NULL to send an empty sync packet.
+ * @param meta Filled in with the header fields of the acknowledgement.
+ *
+ * @return ESP_OK with the acknowledgement in in_buf, or the error of the exchange.
+ */
+static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg, _bluecherry_coap_meta_t* meta)
 {
   uint8_t no_payload_hdr[BLUECHERRY_COAP_HEADER_SIZE];
   uint8_t* data = msg == NULL ? no_payload_hdr : msg->data;
@@ -2212,238 +2349,98 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
   data[3] = tx_message_id & 0xFF;
   data[4] = 0xFF;
 
-  double timeout = BLUECHERRY_ACK_TIMEOUT *
-                   (1 + (esp_random() / 4294967296.0) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
+  /* Entered before the write rather than after it, so an application polling the state cannot
+   * catch the exchange still looking idle. */
+  _bluecherry_set_state(BLUECHERRY_STATE_AWAITING_RESPONSE);
 
-  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
-    _bluecherry_opdata.last_tx_time = time(NULL);
-    _bluecherry_tickle_watchdog();
-
-    if(_bluecherry_mbed_dtls_write(data, data_len) < 0) {
-      return ESP_FAIL;
-    }
-
-    _bluecherry_set_state(BLUECHERRY_STATE_AWAITING_RESPONSE);
-
-    while(true) {
-      int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
-      if(ret > 0) {
-        _bluecherry_opdata.in_buf_len = ret;
-
-        uint8_t rsp_type = 0;
-        uint16_t rsp_message_id = 0;
-        esp_err_t perr = _bluecherry_parse_ack_meta(
-            _bluecherry_opdata.in_buf, _bluecherry_opdata.in_buf_len, &rsp_type, &rsp_message_id);
-        if(perr == ESP_ERR_INVALID_VERSION) {
-          ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
-          continue;
-        }
-        if(perr != ESP_OK) {
-          ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
-          continue;
-        }
-
-        if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
-          ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
-          continue;
-        }
-
-        if(rsp_message_id != tx_message_id) {
-          ESP_LOGD(TAG,
-                   "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
-                   rsp_message_id, tx_message_id);
-          continue;
-        }
-
-        _bluecherry_opdata.cur_message_id = tx_message_id;
-        /* Left at AWAITING_RESPONSE: the response has not been walked, so IDLE would tell an
-         * application waiting to sleep that nothing is outstanding before CONTINUE was read. */
-        return ESP_OK;
-      } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
-        return ESP_FAIL;
-      }
-
-      if(difftime(time(NULL), _bluecherry_opdata.last_tx_time) >= timeout) {
-        break;
-      }
-    }
-
-    timeout *= 2;
+  esp_err_t err = _bluecherry_coap_exchange(data, data_len, tx_message_id, meta);
+  if(err == ESP_OK) {
+    _bluecherry_opdata.cur_message_id = tx_message_id;
   }
 
-  /* Left at AWAITING_RESPONSE for the same reason; the caller moves it to AWAIT_CONNECTION. */
-  return ESP_ERR_TIMEOUT;
+  /* Left at AWAITING_RESPONSE either way. On an ACK the response has not been walked, so IDLE
+   * would tell an application waiting to sleep that nothing is outstanding before CONTINUE was
+   * read; on a failure the caller moves it to AWAIT_CONNECTION. */
+  return err;
 }
 
 /**
- * @brief Common CoAP transmit and receive function for ZTP operations.
- *
- * This function handles the common logic for transmitting and receiving CoAP messages
- * during the Zero Touch Provisioning (ZTP) process. It constructs the CoAP message with
- * the provided header and payload, sends it over the DTLS connection, and waits for
- * a response.
- *
- * The response is not parsed: a fixed header length is skipped and the remainder is handed
- * back verbatim. rx_cap is therefore the only thing standing between a malformed or hostile
- * response and the caller's buffer, so an oversized response is rejected rather than
- * truncated - a short CBOR frame would fail to decode anyway, so the error is the honest
- * outcome.
- *
- * @param tx_buf Pointer to the buffer containing the payload to transmit.
- * @param tx_len Length of the payload to transmit.
- * @param rx_buf Pointer to the buffer where the received data will be stored.
- * @param rx_cap Capacity of rx_buf in bytes.
- * @param rx_len Pointer to a variable where the length of the received data will be stored.
- * @param header Pointer to the CoAP header to be used for the message.
- * @param header_len Length of the CoAP header.
- *
- * @return true if the transmission and reception were successful, false otherwise.
+ * @brief The Uri-Path options of the two provisioning requests, v1/devid and v1/sign.
  */
-static bool _bluecherry_ztp_coap_rxtx_common(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                             size_t rx_cap, uint16_t* rx_len, const uint8_t* header,
-                                             size_t header_len)
+static const uint8_t _ztp_uri_devid[] = { 0xB2, 'v', '1', 0x05, 'd', 'e', 'v', 'i', 'd' };
+static const uint8_t _ztp_uri_sign[] = { 0xB2, 'v', '1', 0x04, 's', 'i', 'g', 'n' };
+
+/**
+ * @brief Exchange one request with the provisioning service.
+ *
+ * Builds a CoAP GET for the given path, runs the exchange and hands back the payload of the
+ * reply. The service answers 2.05 Content with a CBOR payload, or an error code without one when
+ * it refuses the request.
+ *
+ * The reply lands in in_buf, which is idle here: provisioning only runs from
+ * BLUECHERRY_STATE_NOT_PROVISIONED, before any session with the cloud exists. rx_cap is all that
+ * stands between the reply and the caller's buffer, so a payload that does not fit is rejected
+ * rather than truncated - a short CBOR frame would fail to decode anyway.
+ *
+ * @param uri The Uri-Path options of the request.
+ * @param uri_len The length of uri.
+ * @param tx_buf The CBOR payload to send.
+ * @param tx_len The length of tx_buf.
+ * @param rx_buf Where to copy the payload of the reply.
+ * @param rx_cap The capacity of rx_buf in bytes.
+ * @param rx_len Set to the length of the payload copied.
+ *
+ * @return true when the service answered 2.05 and the payload fit, false otherwise.
+ */
+static bool _bluecherry_ztp_coap_rxtx(const uint8_t* uri, size_t uri_len, const uint8_t* tx_buf,
+                                      uint16_t tx_len, uint8_t* rx_buf, size_t rx_cap,
+                                      uint16_t* rx_len)
 {
-  static time_t last_tx_time = 0;
-
-  _bluecherry_opdata.cur_message_id += 1;
-  if(_bluecherry_opdata.cur_message_id == 0) {
-    _bluecherry_opdata.cur_message_id = 1;
-  }
-
-  size_t data_len = header_len;
   uint8_t data[BLUECHERRY_ZTP_TX_BUF_SIZE];
+  size_t data_len = 4 + uri_len + (tx_len > 0 ? 1 + (size_t) tx_len : 0);
 
-  if(header_len + 1 + (size_t) tx_len > sizeof(data)) {
-    ESP_LOGE(TAG, "ZTP request of %u bytes does not fit the transmit buffer",
-             (unsigned) (header_len + 1 + (size_t) tx_len));
+  if(data_len > sizeof(data)) {
+    ESP_LOGE(TAG, "ZTP request of %u bytes does not fit the transmit buffer", (unsigned) data_len);
     return false;
   }
 
-  memcpy(data, header, header_len);
+  uint16_t msg_id = _bluecherry_opdata.cur_message_id + 1;
+  if(msg_id == 0) {
+    msg_id = 1;
+  }
 
+  data[0] = 0x40; /* CON, TKL=0 */
+  data[1] = 0x01; /* GET, which the service requires */
+  data[2] = msg_id >> 8;
+  data[3] = msg_id & 0xFF;
+  memcpy(data + 4, uri, uri_len);
   if(tx_len > 0) {
-    data[header_len] = 0xFF;
-    memcpy(data + header_len + 1, tx_buf, tx_len);
-    data_len = header_len + 1 + tx_len;
+    data[4 + uri_len] = 0xFF;
+    memcpy(data + 5 + uri_len, tx_buf, tx_len);
   }
 
-  double timeout = BLUECHERRY_ACK_TIMEOUT *
-                   (1 + (esp_random() / 4294967296.0) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
+  _bluecherry_coap_meta_t rsp = { 0 };
+  if(_bluecherry_coap_exchange(data, data_len, msg_id, &rsp) != ESP_OK) {
+    return false;
+  }
+  _bluecherry_opdata.cur_message_id = msg_id;
 
-  /* Receive into the session buffer instead of a second kilobyte of stack. Provisioning only
-   * runs from BLUECHERRY_STATE_NOT_PROVISIONED, before any CoAP session exists, so in_buf is
-   * idle and no other path can be reading it. in_buf_len is left alone: the receive path sets
-   * it from the read that fills the buffer, so it never describes what is written here. */
-  uint8_t* rx_scratch = _bluecherry_opdata.in_buf;
-  const size_t rx_scratch_cap = sizeof(_bluecherry_opdata.in_buf);
-
-  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
-    last_tx_time = time(NULL);
-    _bluecherry_tickle_watchdog();
-
-    if(_bluecherry_mbed_dtls_write(data, data_len) < 0)
-      return false;
-
-    while(true) {
-      int ret = _bluecherry_mbed_dtls_read(rx_scratch, rx_scratch_cap);
-
-      if(ret > 0) {
-        if(ret > BLUECHERRY_ZTP_RSP_HEADER_LEN) {
-          size_t payload_len = (size_t) ret - BLUECHERRY_ZTP_RSP_HEADER_LEN;
-          if(payload_len > rx_cap) {
-            ESP_LOGE(TAG, "ZTP response payload of %u bytes exceeds the %u byte buffer",
-                     (unsigned) payload_len, (unsigned) rx_cap);
-            return false;
-          }
-          memcpy(rx_buf, rx_scratch + BLUECHERRY_ZTP_RSP_HEADER_LEN, payload_len);
-          *rx_len = (uint16_t) payload_len;
-        } else {
-          *rx_len = 0;
-        }
-        return true;
-      } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
-        return false;
-      }
-
-      if(difftime(time(NULL), last_tx_time) >= timeout)
-        break;
-    }
-
-    timeout *= 2;
+  if(rsp.code != BLUECHERRY_COAP_RSP_CONTENT) {
+    ESP_LOGE(TAG, "(ZTP) The provisioning service answered %u.%02u", (unsigned) (rsp.code >> 5),
+             (unsigned) (rsp.code & 0x1F));
+    return false;
   }
 
-  return false;
-}
+  size_t payload_len = _bluecherry_opdata.in_buf_len - rsp.payload;
+  if(payload_len > rx_cap) {
+    ESP_LOGE(TAG, "ZTP response payload of %u bytes exceeds the %u byte buffer",
+             (unsigned) payload_len, (unsigned) rx_cap);
+    return false;
+  }
 
-/**
- * @brief CoAP transmit and receive function for requesting device ID.
- *
- * This function constructs and sends a CoAP message to request the device ID
- * from the BlueCherry cloud server. It uses a predefined CoAP header for the
- * device ID request and handles the transmission and reception of the message.
- *
- * @param tx_buf Pointer to the buffer containing the payload to transmit.
- * @param tx_len Length of the payload to transmit.
- * @param rx_buf Pointer to the buffer where the received data will be stored.
- * @param rx_cap Capacity of rx_buf in bytes.
- * @param rx_len Pointer to a variable where the length of the received data will be stored.
- *
- * @return true if the transmission and reception were successful, false otherwise.
- */
-static bool _bluecherry_ztp_coap_rxtx_devid(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                            size_t rx_cap, uint16_t* rx_len)
-{
-  const uint8_t header[] = { 0x40,
-                             0x01,
-                             _bluecherry_opdata.cur_message_id >> 8,
-                             _bluecherry_opdata.cur_message_id & 0xFF,
-                             0xB2,
-                             0x76,
-                             0x31,
-                             0x05,
-                             0x64,
-                             0x65,
-                             0x76,
-                             0x69,
-                             0x64 };
-
-  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_cap, rx_len, header,
-                                          sizeof(header));
-}
-
-/**
- * @brief CoAP transmit and receive function for signing operations.
- *
- * This function constructs and sends a CoAP message to perform signing operations
- * with the BlueCherry cloud server. It uses a predefined CoAP header for the
- * signing request and handles the transmission and reception of the message.
- *
- * @param tx_buf Pointer to the buffer containing the payload to transmit.
- * @param tx_len Length of the payload to transmit.
- * @param rx_buf Pointer to the buffer where the received data will be stored.
- * @param rx_cap Capacity of rx_buf in bytes.
- * @param rx_len Pointer to a variable where the length of the received data will be stored.
- *
- * @return true if the transmission and reception were successful, false otherwise.
- */
-static bool _bluecherry_ztp_coap_rxtx_sign(uint8_t* tx_buf, uint16_t tx_len, uint8_t* rx_buf,
-                                           size_t rx_cap, uint16_t* rx_len)
-{
-  const uint8_t header[] = { 0x40,
-                             0x01,
-                             _bluecherry_opdata.cur_message_id >> 8,
-                             _bluecherry_opdata.cur_message_id & 0xFF,
-                             0xB2,
-                             0x76,
-                             0x31,
-                             0x04,
-                             0x73,
-                             0x69,
-                             0x67,
-                             0x6E };
-
-  return _bluecherry_ztp_coap_rxtx_common(tx_buf, tx_len, rx_buf, rx_cap, rx_len, header,
-                                          sizeof(header));
+  memcpy(rx_buf, _bluecherry_opdata.in_buf + rsp.payload, payload_len);
+  *rx_len = (uint16_t) payload_len;
+  return true;
 }
 
 #pragma endregion
@@ -2864,8 +2861,8 @@ static bool _ztp_request_device_id()
 
   uint8_t in_buf[16];
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_devid(cbor_buf, _ztp_cbor_size(&cbor), in_buf, sizeof(in_buf),
-                                      &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx(_ztp_uri_devid, sizeof(_ztp_uri_devid), cbor_buf,
+                                _ztp_cbor_size(&cbor), in_buf, sizeof(in_buf), &in_len)) {
     ESP_LOGE(TAG, "Failed to sync with ZTP COAP server");
     return false;
   }
@@ -2997,8 +2994,8 @@ static bool _ztp_request_signed_certificate()
   }
 
   uint16_t in_len = 0;
-  if(!_bluecherry_ztp_coap_rxtx_sign(cbor_buf, _ztp_cbor_size(&cbor), coap_data, sizeof(coap_data),
-                                     &in_len)) {
+  if(!_bluecherry_ztp_coap_rxtx(_ztp_uri_sign, sizeof(_ztp_uri_sign), cbor_buf,
+                                _ztp_cbor_size(&cbor), coap_data, sizeof(coap_data), &in_len)) {
     ESP_LOGE(TAG, "Failed to receive response from ZTP COAP server");
     return false;
   }
@@ -3288,80 +3285,60 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  */
 static esp_err_t _bluecherry_sync_once(void)
 {
-  static int64_t last_retry_time_us = 0;
-  static uint32_t retry_interval_ms = 100;
-  static uint32_t provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MS;
+  /* Provisioning and connecting share one back-off. The gate returns at once when the next attempt
+   * is not due yet: the application may be driving bluecherry_sync itself, so this must never
+   * block waiting for a retry to come round. */
+  if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED ||
+     _bluecherry_opdata.state == BLUECHERRY_STATE_AWAIT_CONNECTION) {
+    if(esp_timer_get_time() < _next_attempt_us) {
+      return ESP_ERR_NOT_FINISHED;
+    }
+  }
 
-  /* Obtain credentials before anything else. This is backoff-gated on its own timer rather
-   * than sharing the connect one, so a provisioning service that is down does not also
-   * throttle the reconnects of a device that is already provisioned.
-   *
-   * A deadline rather than an elapsed-time comparison, so that _next_provision_us == 0 means
-   * "due now" and the first attempt after boot is not itself delayed by the backoff.
-   *
-   * At most one attempt per call, and the gate returns immediately when the next one is not
-   * yet due: the application may be driving bluecherry_sync itself, so this must never block
-   * waiting for a retry to come round. */
+  /* Obtain credentials before anything else. */
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_NOT_PROVISIONED) {
-    if(esp_timer_get_time() < _next_provision_us) {
-      return ESP_ERR_NOT_FINISHED;
-    }
-
     if(!_bluecherry_provision()) {
-      ESP_LOGE(TAG, "(ZTP) Provisioning failed, retrying in %lu s", provision_interval_ms / 1000);
-      _next_provision_us = esp_timer_get_time() + (int64_t) provision_interval_ms * 1000;
-
-      provision_interval_ms *= 2;
-      if(provision_interval_ms > BLUECHERRY_PROVISION_RETRY_MAX_MS) {
-        provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MAX_MS;
-      }
+      ESP_LOGE(TAG, "(ZTP) Provisioning failed, retrying in %lu ms",
+               (unsigned long) _bluecherry_retry_later());
       return ESP_ERR_NOT_FINISHED;
     }
 
-    _next_provision_us = 0;
-    provision_interval_ms = BLUECHERRY_PROVISION_RETRY_MS;
+    /* The connection follows in this cycle, from the shortest delay. */
+    _bluecherry_retry_reset();
     _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
   }
 
-  // (re)connect if needed with exponential backoff (non-blocking)
   if(_bluecherry_opdata.state == BLUECHERRY_STATE_AWAIT_CONNECTION) {
-    int64_t now_us = esp_timer_get_time();
-    int64_t elapsed_ms = (now_us - last_retry_time_us) / 1000;
-    if(elapsed_ms >= retry_interval_ms) {
-      last_retry_time_us = now_us;
-      if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_PORT)) {
-        ESP_LOGE(TAG, "Could not connect to BlueCherry server");
-        retry_interval_ms = (retry_interval_ms < 30000) ? retry_interval_ms * 2 : 30000;
-        return ESP_ERR_NOT_FINISHED;
-      }
-
-      _bluecherry_opdata.cur_message_id = 0;
-      _bluecherry_opdata.last_acked_message_id = 0;
-
-      /* A download the cloud already sent chunks for is resumed, anything else in
-       * progress is dropped, and one waiting for its install is kept by the reset. A
-       * protocol reply from the dead session is meaningless, so the priority slot goes
-       * too. */
-      if(!_bluecherry_ota_prepare_resume()) {
-        _bluecherry_ota_reset();
-      }
-      _bluecherry_opdata.pending_event_len = 0;
-
-      /* Not IDLE: the new session still has to run this cycle's exchange. */
-      _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
-      retry_interval_ms = 100;
-
-      /* Only when the cloud lacks it for the running image, see _bluecherry_init_info. */
-      if(!_bluecherry_init_info_known()) {
-        _bluecherry_send_init_info();
-      }
-
-      /* The RESUME goes out once the slot is free. */
-      if(_bluecherry_opdata.ota_resume_due && _bluecherry_opdata.pending_event_len == 0) {
-        _bluecherry_ota_queue_resume();
-      }
-    } else {
+    if(!_bluecherry_dtls_connect(BLUECHERRY_HOST, BLUECHERRY_PORT)) {
+      ESP_LOGE(TAG, "Could not connect to BlueCherry server, retrying in %lu ms",
+               (unsigned long) _bluecherry_retry_later());
       return ESP_ERR_NOT_FINISHED;
+    }
+
+    _bluecherry_retry_reset();
+    _bluecherry_opdata.cur_message_id = 0;
+    _bluecherry_opdata.last_acked_message_id = 0;
+
+    /* A download the cloud already sent chunks for is resumed, anything else in
+     * progress is dropped, and one waiting for its install is kept by the reset. A
+     * protocol reply from the dead session is meaningless, so the priority slot goes
+     * too. */
+    if(!_bluecherry_ota_prepare_resume()) {
+      _bluecherry_ota_reset();
+    }
+    _bluecherry_opdata.pending_event_len = 0;
+
+    /* Not IDLE: the new session still has to run this cycle's exchange. */
+    _bluecherry_set_state(BLUECHERRY_STATE_PENDING_MESSAGES);
+
+    /* Only when the cloud lacks it for the running image, see _bluecherry_init_info. */
+    if(!_bluecherry_init_info_known()) {
+      _bluecherry_send_init_info();
+    }
+
+    /* The RESUME goes out once the slot is free. */
+    if(_bluecherry_opdata.ota_resume_due && _bluecherry_opdata.pending_event_len == 0) {
+      _bluecherry_ota_queue_resume();
     }
   }
 
@@ -3374,6 +3351,7 @@ static esp_err_t _bluecherry_sync_once(void)
    * cannot be observed on entry except as a leftover from a cycle that got no response. */
 
   _bluecherry_msg_t out_msg;
+  _bluecherry_coap_meta_t rsp = { 0 };
 
   // Internal-channel protocol replies jump the application queue. Only one
   // message goes out per sync, so a probe reply left to queue behind a full
@@ -3382,7 +3360,7 @@ static esp_err_t _bluecherry_sync_once(void)
   if(_bluecherry_opdata.pending_event_len > 0) {
     _bluecherry_msg_t ev = { .len = _bluecherry_opdata.pending_event_len,
                              .data = _bluecherry_opdata.pending_event };
-    if(_bluecherry_coap_rxtx(&ev) != ESP_OK) {
+    if(_bluecherry_coap_rxtx(&ev, &rsp) != ESP_OK) {
       ESP_LOGE(TAG, "Could not sync internal event with cloud");
       _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
       return ESP_ERR_NOT_FINISHED;
@@ -3414,7 +3392,7 @@ static esp_err_t _bluecherry_sync_once(void)
   // Peeked, not popped: the message stays in the buffer until its ACK is in, so
   // a failed sync retries it rather than dropping it.
   else if(_bluecherry_ring_peek(&out_msg)) {
-    if(_bluecherry_coap_rxtx(&out_msg) == ESP_OK) {
+    if(_bluecherry_coap_rxtx(&out_msg, &rsp) == ESP_OK) {
       _bluecherry_ring_pop();
     } else {
       ESP_LOGE(TAG, "Could not sync payload with cloud");
@@ -3424,7 +3402,7 @@ static esp_err_t _bluecherry_sync_once(void)
   } else {
     // Nothing to send, but an empty sync is still the only thing that lets the server deliver
     // downlink to a device that never publishes. Whether one is due is the task's decision.
-    if(_bluecherry_coap_rxtx(NULL) != ESP_OK) {
+    if(_bluecherry_coap_rxtx(NULL, &rsp) != ESP_OK) {
       ESP_LOGE(TAG, "Could not sync with cloud");
       _bluecherry_set_state(BLUECHERRY_STATE_AWAIT_CONNECTION);
       return ESP_ERR_NOT_FINISHED;
@@ -3433,51 +3411,16 @@ static esp_err_t _bluecherry_sync_once(void)
 
   bool want_resync = false;
 
-  if(_bluecherry_opdata.in_buf_len < BLUECHERRY_COAP_HEADER_SIZE) {
-    ESP_LOGE(TAG, "Received CoAP packet too small: %u", (unsigned) _bluecherry_opdata.in_buf_len);
-    return ESP_ERR_INVALID_SIZE;
-  }
-
-  uint16_t offset = 0;
-
-  uint8_t header = _bluecherry_opdata.in_buf[offset++];
-  uint8_t version = (header >> 6) & 0x03;
-  if(version != 1) {
-    ESP_LOGE(TAG, "Received CoAP packet with version %d, expeced 1", version);
-    return ESP_ERR_INVALID_VERSION;
-  }
-
-  uint8_t type = (header >> 4) & 0x03;
-  uint8_t token_len = header & 0x0F;
-
-  size_t min_header_len = (size_t) (1 + token_len + 1 + 2 + 1);
-  if(_bluecherry_opdata.in_buf_len < min_header_len) {
-    ESP_LOGE(TAG, "Received CoAP packet with invalid length %u for token length %u",
-             (unsigned) _bluecherry_opdata.in_buf_len, token_len);
-    return ESP_ERR_INVALID_SIZE;
-  }
-
-  offset += token_len;
-  uint8_t code = _bluecherry_opdata.in_buf[offset++];
-  uint16_t msg_id = _bluecherry_opdata.in_buf[offset++];
-  msg_id <<= 8;
-  msg_id |= _bluecherry_opdata.in_buf[offset++];
-  if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
+  /* The exchange already matched this ACK to what was sent. The cloud always writes the payload
+   * marker, even with nothing after it. */
+  if(!rsp.marker) {
     ESP_LOGE(TAG, "Received CoAP packet without payload marker");
     return ESP_ERR_INVALID_RESPONSE;
   }
 
-  if(type == BLUECHERRY_COAP_TYPE_ACK) {
-    if(msg_id != _bluecherry_opdata.cur_message_id) {
-      ESP_LOGE(TAG, "Received ACK for %" PRIu16 " instead of %" PRIu16 "", msg_id,
-               _bluecherry_opdata.cur_message_id);
-      return ESP_ERR_INVALID_STATE;
-    }
+  _bluecherry_opdata.last_acked_message_id = rsp.msg_id;
 
-    _bluecherry_opdata.last_acked_message_id = msg_id;
-  }
-
-  switch(code) {
+  switch(rsp.code) {
   case BLUECHERRY_COAP_RSP_VALID:
     want_resync = false;
     break;
@@ -3487,10 +3430,11 @@ static esp_err_t _bluecherry_sync_once(void)
     break;
 
   default:
-    ESP_LOGE(TAG, "Received invalid CoAP code %02X", code);
+    ESP_LOGE(TAG, "Received invalid CoAP code %02X", rsp.code);
     return ESP_ERR_INVALID_RESPONSE;
   }
 
+  size_t offset = rsp.payload;
   while(offset < _bluecherry_opdata.in_buf_len) {
     /* Both header bytes have to be there before either is read: a single trailing byte would
      * otherwise take the length from past the payload, and from past in_buf itself on a frame
