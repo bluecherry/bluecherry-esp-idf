@@ -182,7 +182,9 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
 /**
  * @brief Report what the BlueCherry connection is doing.
  *
- * Must not block. Wait for BLUECHERRY_STATE_IDLE to know it is safe to sleep.
+ * Must not block. Wait for BLUECHERRY_STATE_IDLE to know it is safe to sleep. The two states
+ * without a session are only reported when a synchronisation could not reach the cloud; the next
+ * one tries again.
  *
  * @param state The state just entered.
  * @param args A NULL pointer.
@@ -190,8 +192,12 @@ static bool bluecherry_ota_handler(bluecherry_ota_event_t event, const bluecherr
 static void bluecherry_state_handler(bluecherry_state state, void* args)
 {
   switch(state) {
+  case BLUECHERRY_STATE_NOT_PROVISIONED:
+    ESP_LOGW(TAG, "BlueCherry could not provision this device");
+    break;
+
   case BLUECHERRY_STATE_AWAIT_CONNECTION:
-    ESP_LOGI(TAG, "BlueCherry connecting...");
+    ESP_LOGW(TAG, "BlueCherry could not connect");
     break;
 
   case BLUECHERRY_STATE_IDLE:

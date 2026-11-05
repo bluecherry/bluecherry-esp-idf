@@ -43,6 +43,7 @@
 #include <mbedtls/pk.h>
 #include <esp_system.h>
 #include <esp_random.h>
+#include <esp_netif.h>
 #include <esp_timer.h>
 #include <esp_attr.h>
 #include <inttypes.h>
@@ -190,15 +191,6 @@ extern "C" {
 #define BLUECHERRY_ZTP_MAX_DEVICE_ID_PARAMS 3
 
 /**
- * @brief Bytes skipped at the head of a ZTP CoAP response.
- *
- * The ZTP exchange does not parse its responses; it skips a fixed header and treats the
- * remainder as the CBOR payload. Any change to the server's response header silently
- * corrupts the payload, so this constant is a contract with the ZTP service.
- */
-#define BLUECHERRY_ZTP_RSP_HEADER_LEN 7
-
-/**
  * @brief The size of the ZTP transmit buffer.
  *
  * Sized to hold the largest ZTP request, which is the CSR: a CoAP header, the payload
@@ -266,11 +258,17 @@ typedef enum {
    *
    * The next bluecherry_sync reads them through the storage handler and, if they are absent,
    * provisions this device before going on to connect.
+   *
+   * Reported to the state handler only when a synchronisation request ends here, which means that
+   * provisioning failed.
    */
   BLUECHERRY_STATE_NOT_PROVISIONED,
 
   /**
    * @brief Credentials are loaded but there is no live session.
+   *
+   * Reported to the state handler only when a synchronisation request ends here, which means that
+   * the connection could not be made.
    */
   BLUECHERRY_STATE_AWAIT_CONNECTION,
 
@@ -304,6 +302,11 @@ typedef enum {
  * Called on every transition, from the synchronisation task, so it must not block. Calling
  * bluecherry_sync from it is safe: that only signals the task.
  *
+ * BLUECHERRY_STATE_NOT_PROVISIONED and BLUECHERRY_STATE_AWAIT_CONNECTION are the exception: they
+ * are reported once when a synchronisation request ends in them, and never on the way in. Every
+ * request therefore ends in exactly one report: BLUECHERRY_STATE_IDLE when it succeeded, one of
+ * those two when it failed.
+ *
  * @param state The state just entered.
  * @param args Optional user arguments, passed when the handler was installed.
  *
@@ -326,8 +329,39 @@ typedef enum {
  */
 typedef enum {
   BLUECHERRY_COAP_RSP_VALID = 0x43,
+  BLUECHERRY_COAP_RSP_CONTENT = 0x45, /* 2.05, what the provisioning service answers with */
   BLUECHERRY_COAP_RSP_CONTINUE = 0x61
 } _bluecherry_coap_response;
+
+/**
+ * @brief The header of a received CoAP message, and where its payload starts.
+ */
+typedef struct {
+  /**
+   * @brief The message type, a _bluecherry_coap_type.
+   */
+  uint8_t type;
+
+  /**
+   * @brief The response code.
+   */
+  uint8_t code;
+
+  /**
+   * @brief The message ID.
+   */
+  uint16_t msg_id;
+
+  /**
+   * @brief Offset of the payload, or the length of the message when there is none.
+   */
+  size_t payload;
+
+  /**
+   * @brief Whether the message carries the payload marker.
+   */
+  bool marker;
+} _bluecherry_coap_meta_t;
 
 /**
  * @brief The possible types of BlueCherry events.
@@ -731,21 +765,6 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.07;
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
 
 /**
- * @brief The initial delay between provisioning attempts.
- */
-#define BLUECHERRY_PROVISION_RETRY_MS 8000
-
-/**
- * @brief The ceiling for the delay between provisioning attempts.
- *
- * The delay runs 8s, 16s, 32s, 64s and is then held there. Every attempt is a full DTLS
- * handshake against the provisioning service, so an unprovisioned device retrying faster than
- * this only loads that service - and unlike a dropped CoAP message there is nothing to gain
- * from reacting quickly. A device provisions once in its life; a minute is nothing.
- */
-#define BLUECHERRY_PROVISION_RETRY_MAX_MS 64000
-
-/**
  * @brief The longest the synchronisation task will sleep while waiting for something to do.
  *
  * The task feeds the task watchdog once per iteration, so this bounds how long the watchdog
@@ -1047,11 +1066,6 @@ typedef struct {
   uint16_t last_acked_message_id;
 
   /**
-   * @brief The last CoAP transmission time.
-   */
-  time_t last_tx_time;
-
-  /**
    * @brief The length of the last incoming buffer data.
    */
   size_t in_buf_len;
@@ -1165,9 +1179,10 @@ typedef struct {
 /**
  * @brief Initialize the BlueCherry subsystem with an existing device certificate.
  *
- * Reserves the publish buffer, the TLS contexts and the synchronisation task. It does not touch
- * the network: the connection is established by the first bluecherry_sync, so this call cannot
- * fail because the cloud is unreachable.
+ * Reserves the publish buffer, the TLS contexts and the synchronisation task, and does not touch
+ * the network, so it cannot fail because the cloud is unreachable. The connection is made by the
+ * first synchronisation: with interval_sec set that one starts right away, with 0 it waits for
+ * bluecherry_sync. Bring the network stack up before either.
  *
  * Before returning it raises BLUECHERRY_OTA_EVENT_FIRSTBOOT, and
  * BLUECHERRY_OTA_EVENT_DOWNLOAD_COMPLETE for a download a deep sleep interrupted, so register the
@@ -1195,9 +1210,9 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
  *
  * Reserves the same resources and raises the same OTA events as bluecherry_init, then returns.
  * Reading the stored credentials, and provisioning this device when there are none, both happen
- * on the first bluecherry_sync - so this call does not touch the network and does not need to be
- * retried in a loop. A provisioning failure is reported by bluecherry_sync instead, which keeps
- * trying with a growing back-off.
+ * on the first synchronisation, which starts as for bluecherry_init - so this call does not touch
+ * the network and does not need to be retried in a loop. A provisioning failure is logged and ends
+ * that synchronisation; the next one tries again.
  *
  * @param ztp_bio_handler The handler used for reading/writing keys and certificates. This must be
  * implemented by the application.
@@ -1227,6 +1242,12 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  * what is queued and dispatches whatever came back - incoming messages to the message handler,
  * firmware updates to the OTA machinery - and keeps cycling until nothing is outstanding.
  *
+ * Provisioning and connecting are attempted once per call. A failed attempt ends the request in
+ * BLUECHERRY_STATE_NOT_PROVISIONED or BLUECHERRY_STATE_AWAIT_CONNECTION, reported to the state
+ * handler, and nothing is retried until the next call or automatic synchronisation. The one
+ * exception is a session that was up before the call and fails on its first message, which is
+ * how a session that died while idle shows itself: that gets one reconnect and one more try.
+ *
  * This is a trigger, not a queue. Calling it repeatedly, or while a cycle is already running,
  * collapses into a single extra cycle and still returns ESP_OK; a trigger raised during a cycle
  * is never lost.
@@ -1234,7 +1255,12 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  * Because nothing is reported back, an application that needs to know when the exchange settled
  * waits for BLUECHERRY_STATE_IDLE, through bluecherry_get_state or a state handler.
  *
- * @return ESP_OK when the task was signalled, ESP_ERR_INVALID_STATE before bluecherry_init.
+ * Without automatic synchronisation, the first call is what connects: initialization does not.
+ * It needs the network stack up, with a network interface created through esp_netif. Without one
+ * the task is not signalled, and the error is logged.
+ *
+ * @return ESP_OK when the task was signalled, ESP_ERR_INVALID_STATE before bluecherry_init or
+ * while no network interface exists.
  */
 esp_err_t bluecherry_sync(void);
 
@@ -1254,6 +1280,11 @@ esp_err_t bluecherry_sync(void);
  * Seconds, not milliseconds, on purpose - this paces traffic to the platform, and anything
  * faster would only load it. It does not throttle the task's own behaviour: a cycle that ends
  * with work outstanding is followed immediately by another, regardless of this setting.
+ *
+ * Enabling it before the first synchronisation starts one now. Each automatic synchronisation
+ * makes the same single attempt as bluecherry_sync, so without a session the interval is also
+ * the pace of attempts to provision or connect; with no network interface yet, each one logs the
+ * same error as bluecherry_sync.
  *
  * @param interval_sec Seconds between automatic synchronisations, or 0 to stop them and leave
  * synchronisation entirely to bluecherry_sync.
@@ -1301,9 +1332,11 @@ esp_err_t bluecherry_set_msg_handler(bluecherry_msg_handler_t handler, void* arg
  * @brief Enqueue an MQTT message for publishing.
  *
  * Copies the message into the publish buffer and returns; a synchronisation is what actually
- * sends it. With automatic synchronisation enabled, one is scheduled here, so nothing further is
- * needed. With it disabled there is no timer either, so the message waits in the buffer until
- * bluecherry_sync is called.
+ * sends it. With automatic synchronisation enabled and a session up, one is scheduled here, so
+ * nothing further is needed. Without a session the message waits for the next automatic
+ * synchronisation, so a busy publisher cannot turn into a stream of connection attempts. With it
+ * disabled there is no timer either, so the message waits in the buffer until bluecherry_sync is
+ * called.
  *
  * Nothing is dropped to make room: a message is kept until the cloud acknowledges it, so once the
  * buffer is full further messages are refused until a synchronisation succeeds. Check the return
