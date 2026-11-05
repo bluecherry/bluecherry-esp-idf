@@ -258,11 +258,17 @@ typedef enum {
    *
    * The next bluecherry_sync reads them through the storage handler and, if they are absent,
    * provisions this device before going on to connect.
+   *
+   * Reported to the state handler only when a synchronisation request ends here, which means that
+   * provisioning failed.
    */
   BLUECHERRY_STATE_NOT_PROVISIONED,
 
   /**
    * @brief Credentials are loaded but there is no live session.
+   *
+   * Reported to the state handler only when a synchronisation request ends here, which means that
+   * the connection could not be made.
    */
   BLUECHERRY_STATE_AWAIT_CONNECTION,
 
@@ -295,6 +301,11 @@ typedef enum {
  *
  * Called on every transition, from the synchronisation task, so it must not block. Calling
  * bluecherry_sync from it is safe: that only signals the task.
+ *
+ * BLUECHERRY_STATE_NOT_PROVISIONED and BLUECHERRY_STATE_AWAIT_CONNECTION are the exception: they
+ * are reported once when a synchronisation request ends in them, and never on the way in. Every
+ * request therefore ends in exactly one report: BLUECHERRY_STATE_IDLE when it succeeded, one of
+ * those two when it failed.
  *
  * @param state The state just entered.
  * @param args Optional user arguments, passed when the handler was installed.
@@ -754,20 +765,6 @@ static const double BLUECHERRY_ACK_RANDOM_FACTOR = 1.07;
 static const uint32_t BLUECHERRY_SSL_READ_TIMEOUT = 100;
 
 /**
- * @brief The delay after a first failed attempt to provision or connect, in milliseconds.
- *
- * It doubles on every further failure up to BLUECHERRY_RETRY_MAX_MS and drops back once an
- * attempt succeeds. Provisioning and connecting share it, because they never overlap: a device
- * cannot connect before it is provisioned, and once it is, it never provisions again.
- */
-#define BLUECHERRY_RETRY_MIN_MS 100
-
-/**
- * @brief The ceiling for the delay between attempts to provision or connect, in milliseconds.
- */
-#define BLUECHERRY_RETRY_MAX_MS 30000
-
-/**
  * @brief The longest the synchronisation task will sleep while waiting for something to do.
  *
  * The task feeds the task watchdog once per iteration, so this bounds how long the watchdog
@@ -1214,8 +1211,8 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key, uint3
  * Reserves the same resources and raises the same OTA events as bluecherry_init, then returns.
  * Reading the stored credentials, and provisioning this device when there are none, both happen
  * on the first synchronisation, which starts as for bluecherry_init - so this call does not touch
- * the network and does not need to be retried in a loop. A provisioning failure is logged instead,
- * and retried with a growing back-off.
+ * the network and does not need to be retried in a loop. A provisioning failure is logged and ends
+ * that synchronisation; the next one tries again.
  *
  * @param ztp_bio_handler The handler used for reading/writing keys and certificates. This must be
  * implemented by the application.
@@ -1244,6 +1241,12 @@ esp_err_t bluecherry_init_ztp(bluecherry_ztp_bio_handler_t ztp_bio_handler,
  * provisions the device if it has no credentials, opens the connection if there is none, sends
  * what is queued and dispatches whatever came back - incoming messages to the message handler,
  * firmware updates to the OTA machinery - and keeps cycling until nothing is outstanding.
+ *
+ * Provisioning and connecting are attempted once per call. A failed attempt ends the request in
+ * BLUECHERRY_STATE_NOT_PROVISIONED or BLUECHERRY_STATE_AWAIT_CONNECTION, reported to the state
+ * handler, and nothing is retried until the next call or automatic synchronisation. The one
+ * exception is a session that was up before the call and fails on its first message, which is
+ * how a session that died while idle shows itself: that gets one reconnect and one more try.
  *
  * This is a trigger, not a queue. Calling it repeatedly, or while a cycle is already running,
  * collapses into a single extra cycle and still returns ESP_OK; a trigger raised during a cycle
@@ -1278,9 +1281,10 @@ esp_err_t bluecherry_sync(void);
  * faster would only load it. It does not throttle the task's own behaviour: a cycle that ends
  * with work outstanding is followed immediately by another, regardless of this setting.
  *
- * Enabling it before synchronisation has started starts the first one now. Like bluecherry_sync,
- * that needs a network interface; while there is none, each attempt logs the same error and is
- * retried on the connection back-off.
+ * Enabling it before the first synchronisation starts one now. Each automatic synchronisation
+ * makes the same single attempt as bluecherry_sync, so without a session the interval is also
+ * the pace of attempts to provision or connect; with no network interface yet, each one logs the
+ * same error as bluecherry_sync.
  *
  * @param interval_sec Seconds between automatic synchronisations, or 0 to stop them and leave
  * synchronisation entirely to bluecherry_sync.
@@ -1328,9 +1332,11 @@ esp_err_t bluecherry_set_msg_handler(bluecherry_msg_handler_t handler, void* arg
  * @brief Enqueue an MQTT message for publishing.
  *
  * Copies the message into the publish buffer and returns; a synchronisation is what actually
- * sends it. With automatic synchronisation enabled, one is scheduled here, so nothing further is
- * needed. With it disabled there is no timer either, so the message waits in the buffer until
- * bluecherry_sync is called.
+ * sends it. With automatic synchronisation enabled and a session up, one is scheduled here, so
+ * nothing further is needed. Without a session the message waits for the next automatic
+ * synchronisation, so a busy publisher cannot turn into a stream of connection attempts. With it
+ * disabled there is no timer either, so the message waits in the buffer until bluecherry_sync is
+ * called.
  *
  * Nothing is dropped to make room: a message is kept until the cloud acknowledges it, so once the
  * buffer is full further messages are refused until a synchronisation succeeds. Check the return

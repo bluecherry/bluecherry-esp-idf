@@ -97,9 +97,14 @@ calls, and use `bluecherry_set_auto_sync` to change the interval at runtime.
 Nothing reaches the network before the first synchronisation. With an interval set, that one starts
 as soon as `bluecherry_init` returns; with `0` it waits for your first `bluecherry_sync`. Either way
 the network stack has to be initialized by then: without a network interface `bluecherry_sync`
-returns `ESP_ERR_INVALID_STATE`, and automatic synchronisation logs the same error and keeps
-retrying. If your network comes up after initialization, pass `0` and call `bluecherry_sync`, or
+returns `ESP_ERR_INVALID_STATE`, and automatic synchronisation logs the same error each time it
+runs. If your network comes up after initialization, pass `0` and call `bluecherry_sync`, or
 `bluecherry_set_auto_sync`, once it is.
+
+Each synchronisation makes one attempt to provision or connect. When that fails the state handler
+is told `BLUECHERRY_STATE_NOT_PROVISIONED` or `BLUECHERRY_STATE_AWAIT_CONNECTION`, and nothing is
+retried until the next `bluecherry_sync` or automatic synchronisation, so the interval, or how
+often you call `bluecherry_sync`, is also how often a device that cannot reach the cloud tries.
 
 `bluecherry_sync` only signals that task and returns; it does not wait for the exchange. To know
 that a message has actually left, wait for `BLUECHERRY_STATE_IDLE` through `bluecherry_get_state`
