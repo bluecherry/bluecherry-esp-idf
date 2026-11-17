@@ -1,0 +1,105 @@
+name: CI
+
+# Two stages: the checks, then the example builds, which start only when the checks passed.
+
+# Documentation alone runs nothing. Run the workflow by hand to build everything.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  workflow_dispatch:
+
+# A newer push to the same branch or pull request cancels the run still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read # the last green run, see "Pick the examples to build"
+  contents: read
+
+jobs:
+  # Stage 1 -----------------------------------------------------------------------------------
+
+  checks:
+    name: Checks
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.changes.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # An example builds, for each of its targets, when it or the component changed. On main that
+      # is since the last green run, so a cancelled or failed run's changes are built again; in a
+      # pull request, since its base. Anything else, or no such commit in the history, builds all.
+      - name: Pick the examples to build
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$EVENT" in
+            pull_request) base=$PR_BASE ;;
+            push) base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=$GITHUB_REF_NAME&event=push&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty' || true) ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only "$base" HEAD)
+            printf 'Changed since %s:\n%s\n' "$base" "$changed"
+          else
+            changed=ALL
+            echo "Nothing to compare with: every example builds."
+          fi
+          has() { [ "$changed" = ALL ] || printf '%s\n' "$changed" | grep -qE "$1"; }
+          component='^(src/|CMakeLists\.txt$|Kconfig$|idf_component\.yml$|\.github/workflows/ci\.yml$)'
+          builds=()
+          # example and target
+          for build in "wifi-template esp32" "wifi-template esp32c3" "wifi-template esp32c6" \
+                       "wifi-template esp32s3" "walter-wifi-template esp32s3"; do
+            example=${build% *}
+            if has "$component|^examples/$example/"; then builds+=("$build"); fi
+          done
+          json=$(printf '%s\n' "${builds[@]}" | jq -Rsc \
+            'split("\n") | map(select(length > 0) | split(" ") | {example: .[0], target: .[1]})')
+          echo "builds=$json" | tee -a "$GITHUB_OUTPUT"
+
+      # Pinned: clang-format releases lay some code out differently. The examples are not checked
+      # yet; wifi-template is not formatted.
+      - name: Formatting of src/ (clang-format 22.1.8)
+        run: >
+          find src \( -name '*.c' -o -name '*.h' \) -print0
+          | xargs -0 pipx run --spec clang-format==22.1.8 clang-format --dry-run --Werror
+
+  # Stage 2 -----------------------------------------------------------------------------------
+
+  esp-idf:
+    name: "ESP-IDF ${{ matrix.idf }}: ${{ matrix.build.example }} (${{ matrix.build.target }})"
+    needs: checks
+    if: ${{ needs.checks.outputs.builds != '[]' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [v5.2.6, v6.1]
+        build: ${{ fromJSON(needs.checks.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The examples depend on the released component; build them against this checkout instead.
+      - name: Use this checkout as the component
+        run: >
+          yq -i 'del(.dependencies["bluecherry/bluecherry"])
+          | .dependencies["bluecherry-esp-idf"].path = "../../../"'
+          examples/${{ matrix.build.example }}/main/idf_component.yml
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.build.target }}
+          path: examples/${{ matrix.build.example }}
